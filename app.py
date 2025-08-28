@@ -49,8 +49,8 @@ if choice == "Ürünler":
     if uploaded_file:
         df_new = pd.read_excel(uploaded_file)
 
-        # Excel kolonlarını göster (hata kontrolü için)
-        st.write("Excel kolonları:", list(df_new.columns))
+        # Excel kolonlarını göster (hata kontrolü için)ƒ
+        #st.write("Excel kolonları:", list(df_new.columns))
 
         for _, row in df_new.iterrows():
             # ürün var mı kontrol et
@@ -169,8 +169,49 @@ elif choice == "Stok Hareketleri":
     )
 
 elif choice == "Satışlar":
-    st.header("Satışlar")
+    st.header("📊 Sales")
 
+    # --- Excel'den Satış Yükleme ---
+    uploaded_sales = st.file_uploader("📂 Upload Sales Excel", type=["xls", "xlsx", "xlsm"])
+    if uploaded_sales:
+        df_sales = pd.read_excel(uploaded_sales)
+
+        # Debug: kolonları görmek istersen aç
+        # st.write("Excel columns:", list(df_sales.columns))
+
+        for _, row in df_sales.iterrows():
+            # Payment Type kontrolü
+            if pd.notna(row.get("Cash")) and row["Cash"] != 0:
+                payment_type = "Cash"
+            elif pd.notna(row.get("Card")) and row["Card"] != 0:
+                payment_type = "Card"
+            else:
+                payment_type = None   # boş geç
+
+            # Order tablosuna müşteri ve tarih ekle
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO orders(date, customer, payment_type)
+                VALUES(?,?,?)
+            """, (row["Date"], row["Customer"], payment_type))
+            order_id = cur.lastrowid
+
+            # Product ID bul
+            product_result = conn.execute("SELECT id FROM products WHERE name=?",
+                                          (row["Product Name"],)).fetchone()
+            product_id = product_result[0] if product_result else None
+
+            # Order_lines tablosuna ürün ve fiyat ekle
+            cur.execute("""
+                INSERT INTO order_lines(order_id, product_id, quantity, unit_price)
+                VALUES(?,?,?,?)
+            """, (order_id, product_id, row["Piece"], row["Sale Price"]))
+
+            conn.commit()
+
+        st.success("✅ Sales Excel uploaded successfully!")
+
+    # --- Veritabanından Satışları Göster ---
     q = """
     SELECT 
         o.date AS Date,
@@ -195,7 +236,7 @@ elif choice == "Satışlar":
     ORDER BY o.date DESC
     """
 
-    st.dataframe(pd.read_sql(q, conn))
+    st.dataframe(pd.read_sql(q, conn), use_container_width=True)
 
 
 elif choice == "Raporlar":
