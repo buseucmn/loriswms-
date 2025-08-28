@@ -39,6 +39,8 @@ if st.sidebar.button("Çıkış Yap"):
     st.rerun()
 
 choice = st.sidebar.selectbox("Menü", menu)
+from datetime import date   # ⬅️ Bunu dosyanın en üstüne ekle (importların yanına)
+
 if choice == "Ürünler":
     st.header("Ürün Listesi")
 
@@ -46,6 +48,9 @@ if choice == "Ürünler":
     uploaded_file = st.file_uploader("📂 Excel'den Ürün ve Stok Yükle", type=["xls", "xlsx"])
     if uploaded_file:
         df_new = pd.read_excel(uploaded_file)
+
+        # Excel kolonlarını göster (hata kontrolü için)
+        st.write("Excel kolonları:", list(df_new.columns))
 
         for _, row in df_new.iterrows():
             # ürün var mı kontrol et
@@ -64,9 +69,10 @@ if choice == "Ürünler":
             # stok hareketi ekle (ilk giriş)
             cur.execute(
                 "INSERT INTO movements(product_id, date, type, quantity, note, branch) VALUES(?,?,?,?,?,?)",
-                (product_id, str(date.today()), "IN", row["Stock"], "Excel Yükleme", "Main Warehouse")
+                (product_id, str(date.today()), "IN", row["Stock"], "Excel Upload", "Main Warehouse")
             )
             conn.commit()
+
         st.success("Excel’den veriler başarıyla yüklendi ✅")
 
     # Ürünleri veritabanından oku ve hesaplamaları yap
@@ -141,8 +147,6 @@ elif choice == "Stok Hareketleri":
     ORDER BY p.id, m.date, m.id
     """
     df = pd.read_sql(q, conn)
-
-    # Tarihi datetime tipine çevir
     df["Tarih"] = pd.to_datetime(df["Tarih"])
 
     # IN = +, OUT = - olacak şekilde Etki sütunu
