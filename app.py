@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
+
 # Kullanıcı bilgileri
 USERS = {
     "admin": "1234",   # yönetici
@@ -27,6 +28,16 @@ if not st.session_state.logged_in:
 # --- Veritabanı bağlantısı ---
 conn = sqlite3.connect("test.db", check_same_thread=False)
 
+# --- Column1 hesaplama fonksiyonu ---
+def get_cost(product_name, fallback_cost):
+    row_cost = conn.execute(
+        "SELECT cost FROM products WHERE name=?", (product_name,)
+    ).fetchone()
+    if row_cost is not None and row_cost[0] is not None:
+        return row_cost[0]
+    return pd.to_numeric(fallback_cost, errors="coerce") if fallback_cost is not None else 0
+
+
 st.title("📦 Loris Perfume - Mini WMS")
 
 if st.session_state.user == "admin":
@@ -48,6 +59,11 @@ if choice == "Ürünler":
     uploaded_file = st.file_uploader("📂 Excel'den Ürün ve Stok Yükle", type=["xls", "xlsx"])
     if uploaded_file:
         df_new = pd.read_excel(uploaded_file)
+        df_new.columns = df_new.columns.str.strip()  # başlıklardaki boşlukları temizle
+        df_new.rename(columns={"Product name": "Product Name"}, inplace=True)  # olası küçük-büyük farkını düzelt
+        for c in ["Cost", "Price", "Shelf Price", "Stock"]:
+            df_new[c] = pd.to_numeric(df_new[c], errors="coerce").fillna(0)   # sayısal yap, boşsa 0
+
 
         # Excel kolonlarını göster (hata kontrolü için)ƒ
         #st.write("Excel kolonları:", list(df_new.columns))
@@ -171,91 +187,165 @@ elif choice == "Stok Hareketleri":
 elif choice == "Satışlar":
     st.header("📊 Sales")
 
-    # --- Excel'den Satış Yükleme ---
     uploaded_sales = st.file_uploader("📂 Upload Sales Excel", type=["xls", "xlsx", "xlsm"])
+    import openpyxl
+    import pandas as pd
+
+    # hangi sheet'ler var diye kontrol et
+    xls = pd.ExcelFile(uploaded_sales)
+    st.write("Excel içindeki sheet isimleri:", xls.sheet_names)
+
     if uploaded_sales:
-        df_sales = pd.read_excel(uploaded_sales)
+        # 1) Doğru sheet'i bul
+        df_sales = None
+        for cand in ["Sales", "Satışlar", "Satislar", "SATISLAR", "Satişlar"]:
+            try:
+                df_sales = pd.read_excel(uploaded_sales, sheet_name=cand)
+                break
+            except Exception:
+                continue
+        if df_sales is None:
+            df_sales = pd.read_excel(uploaded_sales, sheet_name=0)  # fallback: ilk sheet
 
-        # Debug: kolonları görmek istersen aç
-        # st.write("Excel columns:", list(df_sales.columns))
+        # 2) Kolon adlarını normalize et
+        df_sales.columns = df_sales.columns.astype(str).str.strip()
+        df_sales.rename(
+            columns={
+                "Product name": "Product Name",
+                "product name": "Product Name",
+                "Sale_Price": "Sale Price",
+                "sale price": "Sale Price",
+                "sale_price": "Sale Price",
+                "piece": "Piece",
+            },
+            inplace=True,
+        )
 
+        # 3) Zorunlu kolonlar yoksa ekle
+        required_defaults = {
+            "Date": pd.NaT,
+            "Customer": "",
+            "Product Name": "",
+            "Sale Price": 0,
+            "Piece": 0,
+            "Cash": 0,
+            "Card": 0,
+            "Note": 0,  # Note başta yoksa 0
+        }
+        for col, default in required_defaults.items():
+            if col not in df_sales.columns:
+                df_sales[col] = default
+
+        # 4) Sayısal kolonları dönüştür
+        for c in ["Sale Price", "Piece", "Cash", "Card", "Note"]:
+            df_sales[c] = pd.to_numeric(df_sales[c], errors="coerce").fillna(0)
+
+        # 5) NOTE (VLOOKUP benzeri): Note boş/0 ise DB’den cost çek
+        products_df = pd.read_sql("SELECT name, cost FROM products", conn)
+        cost_map = dict(zip(products_df["name"], products_df["cost"]))
+        df_sales.loc[df_sales["Note"] == 0, "Note"] = (
+            df_sales["Product Name"].map(cost_map).fillna(0)
+        )
+
+        # 6) Payment Type
+        df_sales["Payment_Type"] = df_sales.apply(
+            lambda r: "Cash" if r["Cash"] != 0 else ("Card" if r["Card"] != 0 else ""),
+            axis=1,
+        )
+
+        # 7) Hesaplamalar
+        df_sales["Total_Cash"] = df_sales.apply(
+            lambda r: r["Piece"] * r["Sale Price"] if r["Payment_Type"] == "Cash" else 0,
+            axis=1,
+        )
+        df_sales["Total_Card"] = df_sales.apply(
+            lambda r: r["Piece"] * r["Sale Price"] if r["Payment_Type"] == "Card" else 0,
+            axis=1,
+        )
+        df_sales["General_Total"] = df_sales["Total_Cash"] + df_sales["Total_Card"]
+        df_sales["Column1"] = df_sales["Note"] * df_sales["Piece"]
+
+        # 8) SQL'e kaydet
+        cur = conn.cursor()
         for _, row in df_sales.iterrows():
-            # Payment Type kontrolü
-            if pd.notna(row.get("Cash")) and row["Cash"] != 0:
-                payment_type = "Cash"
-            elif pd.notna(row.get("Card")) and row["Card"] != 0:
-                payment_type = "Card"
+            cur.execute("SELECT id FROM products WHERE name=?", (row["Product Name"],))
+            result = cur.fetchone()
+            if result:
+                product_id = result[0]
             else:
-                payment_type = None   # boş geç
+                cur.execute(
+                    "INSERT INTO products(name, unit, cost, price, shelf_price) VALUES(?,?,?,?,?)",
+                    (
+                        row["Product Name"],
+                        "Adet",
+                        float(row["Note"]),
+                        float(row["Sale Price"]),
+                        float(row["Sale Price"]),
+                    ),
+                )
+                product_id = cur.lastrowid
 
-            # Order tablosuna müşteri ve tarih ekle
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO orders(date, customer, payment_type)
-                VALUES(?,?,?)
-            """, (row["Date"], row["Customer"], payment_type))
+            d = pd.to_datetime(row["Date"], errors="coerce")
+            date_str = d.date().isoformat() if not pd.isna(d) else str(date.today())
+
+            cur.execute(
+                "INSERT INTO orders(customer, date, status, payment_type) VALUES(?,?,?,?)",
+                (str(row["Customer"]), date_str, "Completed", row["Payment_Type"]),
+            )
             order_id = cur.lastrowid
 
-            # Product ID bul
-            product_result = conn.execute("SELECT id FROM products WHERE name=?",
-                                          (row["Product Name"],)).fetchone()
-            product_id = product_result[0] if product_result else None
+            cur.execute(
+                "INSERT INTO order_lines(order_id, product_id, quantity, unit_price) VALUES(?,?,?,?)",
+                (order_id, product_id, float(row["Piece"]), float(row["Sale Price"])),
+            )
 
-            # Order_lines tablosuna ürün ve fiyat ekle
-            cur.execute("""
-                INSERT INTO order_lines(order_id, product_id, quantity, unit_price)
-                VALUES(?,?,?,?)
-            """, (order_id, product_id, row["Piece"], row["Sale Price"]))
+            cur.execute(
+                "INSERT INTO movements(product_id, date, type, quantity, note, branch) VALUES(?,?,?,?,?,?)",
+                (product_id, date_str, "OUT", float(row["Piece"]), "Sale Excel Upload", "Main Warehouse"),
+            )
 
-            conn.commit()
+        conn.commit()
 
-        st.success("✅ Sales Excel uploaded successfully!")
-
-    # --- Veritabanından Satışları Göster ---
-    q = """
-    SELECT 
-        o.date AS Date,
-        o.customer AS Customer,
-        p.name AS Product_Name,
-        (
-            IFNULL(SUM(CASE WHEN m.type='IN' THEN m.quantity ELSE 0 END),0)
-            - IFNULL(SUM(CASE WHEN m.type='OUT' THEN m.quantity ELSE 0 END),0)
-        ) AS Current_Stock,
-        l.unit_price AS Sale_Price,
-        CASE WHEN o.payment_type = 'Cash' THEN (l.quantity * l.unit_price) ELSE 0 END AS Cash,
-        CASE WHEN o.payment_type = 'Card' THEN (l.quantity * l.unit_price) ELSE 0 END AS Card,
-        l.quantity AS Piece,
-        CASE WHEN o.payment_type = 'Cash' THEN (l.quantity * l.unit_price) ELSE 0 END AS Total_Cash,
-        CASE WHEN o.payment_type = 'Card' THEN (l.quantity * l.unit_price) ELSE 0 END AS Total_Card,
-        (l.quantity * l.unit_price) AS General_Total
-    FROM orders o
-    JOIN order_lines l ON o.id = l.order_id
-    JOIN products p ON l.product_id = p.id
-    LEFT JOIN movements m ON m.product_id = p.id
-    GROUP BY o.id, l.id
-    ORDER BY o.date DESC
-    """
-
-    st.dataframe(pd.read_sql(q, conn), use_container_width=True)
-
+        # 9) Tabloyu göster
+        st.dataframe(
+            df_sales[
+                [
+                    "Date",
+                    "Customer",
+                    "Product Name",
+                    "Piece",
+                    "Sale Price",
+                    "Cash",
+                    "Card",
+                    "Payment_Type",
+                    "Total_Cash",
+                    "Total_Card",
+                    "General_Total",
+                    "Note",
+                    "Column1",
+                ]
+            ],
+            use_container_width=True,
+        )
+        st.success("✅ Sales Excel işlendi, Note Products’tan dolduruldu (VLOOKUP), tüm hesaplamalar tamam.")
 
 elif choice == "Raporlar":
-    st.subheader("Şube Bazlı Stoklar")
-    branch_q = """
-    SELECT p.name,
-           m.branch,
-           SUM(CASE WHEN m.type='IN' THEN m.quantity ELSE 0 END) -
-           SUM(CASE WHEN m.type='OUT' THEN m.quantity ELSE 0 END) AS current_stock
-    FROM products p
-    JOIN movements m ON p.id = m.product_id
-    GROUP BY p.name, m.branch
-    """
-    st.dataframe(pd.read_sql(branch_q, conn))
+     st.subheader("Şube Bazlı Stoklar")
+     branch_q = """
+        SELECT p.name,
+            m.branch,
+            SUM(CASE WHEN m.type='IN' THEN m.quantity ELSE 0 END) -
+            SUM(CASE WHEN m.type='OUT' THEN m.quantity ELSE 0 END) AS current_stock
+        FROM products p
+        JOIN movements m ON p.id = m.product_id
+        GROUP BY p.name, m.branch
+        """
+     st.dataframe(pd.read_sql(branch_q, conn))
 
-    st.header("Raporlar")
+     st.header("Raporlar")
 
-    st.subheader("Stok Durumu")
-    stock_q = """
+     st.subheader("Stok Durumu")
+     stock_q = """
     SELECT p.name,
            SUM(CASE WHEN m.type='IN'  THEN m.quantity ELSE 0 END) -
            SUM(CASE WHEN m.type='OUT' THEN m.quantity ELSE 0 END) AS current_stock
@@ -263,19 +353,19 @@ elif choice == "Raporlar":
     LEFT JOIN movements m ON p.id = m.product_id
     GROUP BY p.id
     """
-    st.dataframe(pd.read_sql(stock_q, conn))
+     st.dataframe(pd.read_sql(stock_q, conn))
 
-    st.subheader("En Çok Satan Ürünler")
-    top_q = """
+     st.subheader("En Çok Satan Ürünler")
+     top_q = """
     SELECT p.name, SUM(l.quantity) AS total_sold
     FROM order_lines l
     JOIN products p ON l.product_id = p.id
     GROUP BY p.name
     ORDER BY total_sold DESC
     """
-    st.dataframe(pd.read_sql(top_q, conn))
-    st.subheader("Günlük Satış Grafiği")
-    sales_q = """
+     st.dataframe(pd.read_sql(top_q, conn))
+     st.subheader("Günlük Satış Grafiği")
+     sales_q = """
     SELECT o.date,
            SUM(l.quantity * l.unit_price) AS daily_sales
     FROM orders o
@@ -283,5 +373,5 @@ elif choice == "Raporlar":
     GROUP BY o.date
     ORDER BY o.date
     """
-    df_sales = pd.read_sql(sales_q, conn)
-    st.line_chart(df_sales.set_index("date"))
+     df_sales = pd.read_sql(sales_q, conn)
+     st.line_chart(df_sales.set_index("date"))
