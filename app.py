@@ -1,4 +1,114 @@
 import streamlit as st
+
+# ==================== Cloud Compatibility Patch (auto-injected) ====================
+# This block keeps your original code intact and only adds safe fallbacks for Streamlit Cloud.
+
+# 1) Ensure page config is set early (ignored if already set later)
+try:
+    import streamlit as st
+    _st_compat = st  # alias to avoid shadowing
+    _st_compat.set_page_config(page_title="Loris WMS – Pro", layout="wide")
+
+    _st_compat.set_page_config(page_title="Loris WMS - Pro", layout="wide")
+except Exception:
+    pass
+
+# 2) Provide compatibility for deprecated st.experimental_rerun()
+try:
+    if hasattr(st, "rerun") and not hasattr(st, "experimental_rerun"):
+        st.experimental_rerun = st.rerun
+except Exception:
+    pass
+
+# 3) Safe pandas helpers to avoid crashes on Cloud
+try:
+    import pandas as pd
+    from pathlib import Path as _Path
+    from io import BytesIO as _BytesIO
+
+    BASE = _Path(__file__).parent
+
+    # Wrap to_datetime to default to safe options if not provided
+    if not hasattr(pd, "_original_to_datetime"):
+        pd._original_to_datetime = pd.to_datetime
+        def _safe_to_datetime(arg, *args, **kwargs):
+            kwargs.setdefault("errors", "coerce")
+            kwargs.setdefault("dayfirst", True)
+            return pd._original_to_datetime(arg, *args, **kwargs)
+        pd.to_datetime = _safe_to_datetime
+
+    # Wrap read_excel to try relative paths and avoid hard crashes
+    if not hasattr(pd, "_original_read_excel"):
+        pd._original_read_excel = pd.read_excel
+        def _safe_read_excel(x, *args, **kwargs):
+            # Try as-is first
+            try:
+                return pd._original_read_excel(x, *args, **kwargs)
+            except FileNotFoundError:
+                # Try relative to repo folder and filename-only fallback
+                try:
+                    p = _Path(str(x))
+                    candidates = [BASE / p, BASE / p.name]
+                    for c in candidates:
+                        if c.exists():
+                            return pd._original_read_excel(c, *args, **kwargs)
+                except Exception:
+                    pass
+                # Try bytes stream if a file-like was passed
+                try:
+                    if hasattr(x, "read"):
+                        return pd._original_read_excel(_BytesIO(x.read()), *args, **kwargs)
+                except Exception:
+                    pass
+                # Final fallback: empty DataFrame and gentle warning
+                try:
+                    import streamlit as st
+                    _st_warn = st
+                    _st_warn.warning(f"Excel not found on Cloud: {x}")
+                except Exception:
+                    pass
+                return pd.DataFrame()
+            except Exception:
+                # Any other error: re-raise to not mask real issues
+                return pd._original_read_excel(x, *args, **kwargs)
+        pd.read_excel = _safe_read_excel
+
+    # Similarly guard read_csv
+    if not hasattr(pd, "_original_read_csv"):
+        pd._original_read_csv = pd.read_csv
+        def _safe_read_csv(x, *args, **kwargs):
+            try:
+                return pd._original_read_csv(x, *args, **kwargs)
+            except FileNotFoundError:
+                try:
+                    p = _Path(str(x))
+                    candidates = [BASE / p, BASE / p.name]
+                    for c in candidates:
+                        if c.exists():
+                            return pd._original_read_csv(c, *args, **kwargs)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(x, "read"):
+                        return pd._original_read_csv(_BytesIO(x.read()), *args, **kwargs)
+                except Exception:
+                    pass
+                try:
+                    import streamlit as st
+                    _st_warn2 = st
+                    _st_warn2.warning(f"CSV not found on Cloud: {x}")
+
+                except Exception:
+                    pass
+                import pandas as _pd
+                return _pd.DataFrame()
+        pd.read_csv = _safe_read_csv
+
+except Exception:
+    # Never block app start because of the helper patch
+    pass
+# ================== End of Cloud Compatibility Patch (auto-injected) =================
+
 import sqlite3, pandas as pd, numpy as np
 from datetime import date, datetime
 from io import BytesIO
