@@ -512,7 +512,7 @@ elif choice==t("menu_moves"):
       FROM movements m JOIN products p ON p.id=m.product_id
       ORDER BY m.date DESC, m.id DESC
     """, conn)
-    df["Tarih"] = pd.to_datetime(df["Tarih"])
+    df["Tarih"] = pd.to_datetime(df["Tarih"], errors="coerce", dayfirst=True)
     df = df[(df["Tarih"]>=pd.to_datetime(date_from)) & (df["Tarih"]<=pd.to_datetime(date_to))]
     cols_all=list(df.columns)
     show_cols=st.multiselect(t("choose_cols"), cols_all, default=cols_all, key="mov_cols")
