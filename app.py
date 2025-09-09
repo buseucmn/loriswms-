@@ -1,961 +1,1304 @@
 import streamlit as st
-# ==== CLOUD PATCH (put right after "import streamlit as st") ====
+import sqlite3
+import pandas as pd
+from io import BytesIO
+from datetime import datetime, date 
+import streamlit as st
+st.set_page_config(layout="wide")
+import shutil
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
+# ---------- DB Helpers (kalıcı kayıt) ----------
+DB_PATH = "data/loris.db"
+
+def get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        cur.execute("PRAGMA foreign_keys=ON;")
+        # Ürünler (sen zaten kullanıyorsun; gerekirse kolon isimlerini kendi şemanla eşleştir)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            unit TEXT,
+            cost REAL,
+            price REAL,
+            shelf_price REAL,
+            stock_in REAL DEFAULT 0,
+            stock_out REAL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+        """)
+
+        # Ürün yükleme geçmişi (opsiyonel)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS upload_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT,
+            uploaded_at TEXT DEFAULT (datetime('now'))
+        )
+        """)
+
+        # Stok ham verisi (kümülatif)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS stock_raw (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            product_name TEXT,
+            movement TEXT,          -- 'in' / 'out'
+            quantity REAL,
+            note TEXT,
+            current_stock REAL,
+            uploaded_at TEXT,
+            batch_id TEXT
+        )
+        """)
+
+        # Satış ham verisi (kümülatif)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS sales_raw (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            customer TEXT,
+            product_name TEXT,
+            piece INTEGER,
+            sale_price REAL,
+            total_cash REAL,
+            total_card REAL,
+            general_total REAL,
+            cost REAL,
+            total_cost REAL,
+            payment_type TEXT,
+            uploaded_at TEXT,
+            batch_id TEXT
+        )
+        """)
+
+        conn.commit()
+def ensure_daily_backup():
+    """
+    data/loris.db -> backups/loris_YYYYMMDD.db
+    Günlük tek kopya. Sessiz çalışır.
+    """
+    try:
+        db = Path(DB_PATH)
+        if not db.exists():
+            return  # DB yoksa sessizce geç
+
+        bdir = Path("backups")
+        bdir.mkdir(parents=True, exist_ok=True)
+
+        today = datetime.now().strftime("%Y%m%d")
+        target = bdir / f"loris_{today}.db"
+
+        if not target.exists():
+            shutil.copy2(db, target)
+            # hiçbir mesaj gösterme (sessiz)
+    except Exception:
+        # Sessiz: burada kullanıcıya bir şey göstermiyoruz.
+        # İstersen ileride logging ekleriz.
+        pass
+# Uygulama açılırken mutlaka çalışsın
+init_db()
+ensure_daily_backup()
+# ---------- Kayıt Fonksiyonları ----------
+def save_stock_rows(df_stock: pd.DataFrame, batch_id: str, filename: str = None):
+    """df_stock (normalized) -> stock_raw'a ekler + upload_history kaydı."""
+    if df_stock is None or df_stock.empty:
+        return
+
+    # Güvenli kolon seçimi
+    cols = {c.lower(): c for c in df_stock.columns}
+    def pick(name, default=None):
+        return df_stock[cols[name]].copy() if name in cols else default
+
+    to_save = pd.DataFrame({
+        "date": pick("date", pd.NaT),
+        "product_name": pick("product_name", ""),
+        "movement": pick("movement", ""),
+        "quantity": pick("quantity", 0),
+        "note": pick("note", ""),
+        "current_stock": pick("current_stock", 0),
+    })
+    to_save["uploaded_at"] = datetime.utcnow().isoformat()
+    to_save["batch_id"] = batch_id
+
+    with get_conn() as conn:
+        to_save.to_sql("stock_raw", conn, if_exists="append", index=False)
+        if filename:
+            pd.DataFrame([{"filename": filename}]).to_sql("upload_history", conn, if_exists="append", index=False)
+
+def save_sales_rows(df_sales: pd.DataFrame, batch_id: str, filename: str = None):
+    """df_sales (normalized) -> sales_raw'a ekler + upload_history kaydı."""
+    if df_sales is None or df_sales.empty:
+        return
+
+    cols = {c.lower(): c for c in df_sales.columns}
+    def pick(name, default=None):
+        return df_sales[cols[name]].copy() if name in cols else default
+
+    to_save = pd.DataFrame({
+        "date": pick("date", pd.NaT),
+        "customer": pick("customer", ""),
+        "product_name": pick("product_name", ""),
+        "piece": pick("piece", 0),
+        "sale_price": pick("sale_price", 0.0),
+        "total_cash": pick("total_cash", 0.0),
+        "total_card": pick("total_card", 0.0),
+        "general_total": pick("general_total", 0.0),
+        "cost": pick("cost", 0.0),
+        "total_cost": pick("total_cost", 0.0),
+        "payment_type": pick("payment_type", ""),
+    })
+    to_save["uploaded_at"] = datetime.utcnow().isoformat()
+    to_save["batch_id"] = batch_id
+
+    with get_conn() as conn:
+        to_save.to_sql("sales_raw", conn, if_exists="append", index=False)
+        if filename:
+            pd.DataFrame([{"filename": filename}]).to_sql("upload_history", conn, if_exists="append", index=False)
+# ---------- Mini çeviri yardımcı ----------
+def T(tr_text, en_text):
+    lang = st.session_state.get("lang", "Türkçe")
+    return tr_text if lang == "Türkçe" else en_text
+# === Language bootstrap & helper (GLOBAL) ===
+if "lang" not in st.session_state:
+    st.session_state.lang = "Türkçe"
+
+def T(tr: str, en: str) -> str:
+    """TR/EN döndüren küçük yardımcı."""
+    return en if st.session_state.lang != "Türkçe" else tr
+# --- Satışlar için kolon isimlerini normalize eden fonksiyon ---
+def normalize(col):
+    return (str(col).lower()
+            .replace("ı", "i")
+            .replace("ş", "s")
+            .replace("ü", "u")
+            .replace("ö", "o")
+            .replace("ç", "c")
+            .strip())
+
+rename_map_sales = {
+    "date": "date",
+    "tarih": "date",
+
+    "customer": "customer",
+    "müşteri": "customer",
+    "musteri": "customer",
+
+    "product name": "product_name",
+    "ürün adı": "product_name",
+    "urun adi": "product_name",
+
+    "current stock": "current_stock",  # sadece okunacak, hesaplamada kullanmıyoruz
+
+    "sale price": "sale_price",
+    "satış fiyatı": "sale_price",
+    "satis fiyati": "sale_price",
+    "price": "sale_price",
+
+    "piece": "quantity",
+    "adet": "quantity",
+
+    "cash": "cash",
+    "nakit": "cash",
+
+    "card": "card",
+    "kart": "card",
+
+    "total cash": "total_cash",
+    "total card": "total_card",
+
+    "general total": "general_total",
+    "genel toplam": "general_total",
+
+    "cost": "cost",
+    "alış fiyatı": "cost",
+    "alis fiyati": "cost",
+
+    "total cost": "total_cost",
+    "toplam maliyet": "total_cost"
+}
+
+# Products tablosuna gerekli kolonları ekle (eksikse)
+def ensure_product_columns():
+    expected_cols = {
+        "upload_id": "INTEGER",
+        "product_name": "TEXT",
+        "unit": "TEXT",
+        "cost": "REAL DEFAULT 0",
+        "price": "REAL DEFAULT 0",
+        "shelf_price": "REAL DEFAULT 0",
+        "stock_in": "INTEGER DEFAULT 0",
+        "stock_out": "INTEGER DEFAULT 0",
+        "notes": "TEXT"
+    }
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # mevcut kolonları oku
+        cur.execute("PRAGMA table_info(products)")
+        existing = [row[1] for row in cur.fetchall()]
+        # eksikleri ekle
+        for col, coltype in expected_cols.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE products ADD COLUMN {col} {coltype}")
+        conn.commit()
+
+ensure_product_columns()
+# Upload history tablosunu oluştur
+def ensure_upload_history():
+    with get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS upload_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT NOT NULL,
+                uploaded_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+ensure_upload_history()
+
+# --- Mini çeviri helper'ı (genel sözlük gelene kadar) ---
+def L(tr, en):
+    return tr if st.session_state.get("lang", "Türkçe") == "Türkçe" else en
+
+
+# ---------- ÜRÜN YARDIMCI FONKSİYONLARI ----------
+
+def list_products(search: str = "", include_inactive: bool = False) -> pd.DataFrame:
+    q = """
+    SELECT id, name AS "Ürün Adı", barcode AS "Barkod", price AS "Fiyat",
+           stock AS "Stok", description AS "Açıklama", is_active AS "Aktif",
+           created_at AS "Oluşturma", updated_at AS "Güncelleme"
+    FROM products
+    WHERE 1=1
+    """
+    params = []
+    if not include_inactive:
+        q += " AND is_active = 1"
+    if search:
+        q += " AND (LOWER(name) LIKE ? OR LOWER(IFNULL(barcode,'')) LIKE ?)"
+        s = f"%{search.lower()}%"
+        params += [s, s]
+    q += " ORDER BY name ASC"
+    with get_conn() as conn:
+        df = pd.read_sql_query(q, conn, params=params)
+    return df
+
+def add_stock_move(product_id: int, change: int, reason: str = "manual", ref: str = None):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO stock_moves (product_id, change, reason, ref, ts) VALUES (?,?,?,?,?)",
+            (product_id, change, reason, ref, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+
+def add_product(name: str, barcode: str, price: float, stock: int, description: str):
+    now = datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO products (name, barcode, price, stock, description, is_active, created_at, updated_at)
+            VALUES (?,?,?,?,?,1,?,?)
+        """, (name.strip(), (barcode or None), float(price or 0), int(stock or 0), (description or "").strip(), now, now))
+        pid = c.lastrowid
+        conn.commit()
+    if stock:
+        add_stock_move(pid, int(stock), reason="initial")
+    return pid
+
+def update_product(pid: int, name: str, barcode: str, price: float, stock: int, description: str):
+    # Mevcut stok ile yeni stok arasındaki farkı hareket olarak yaz
+    with get_conn() as conn:
+        c = conn.cursor()
+        old = c.execute("SELECT stock FROM products WHERE id=?", (pid,)).fetchone()
+        old_stock = int(old[0]) if old else 0
+        diff = int(stock) - old_stock
+        now = datetime.utcnow().isoformat()
+        c.execute("""
+            UPDATE products
+               SET name=?, barcode=?, price=?, stock=?, description=?, updated_at=?
+             WHERE id=?
+        """, (name.strip(), (barcode or None), float(price or 0), int(stock or 0), (description or "").strip(), now, pid))
+        conn.commit()
+    if diff != 0:
+        add_stock_move(pid, diff, reason="manual_adjust")
+
+def soft_delete_product(pid: int):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE products SET is_active=0, updated_at=? WHERE id=?", (datetime.utcnow().isoformat(), pid))
+        conn.commit()
+
+def restore_product(pid: int):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE products SET is_active=1, updated_at=? WHERE id=?", (datetime.utcnow().isoformat(), pid))
+        conn.commit()
+
+# ---------- EXCEL İÇE/DIŞA AKTARIM ----------
+
+PRODUCTS_COL_MAP = {
+    # bizde → onlardan gelebilecek olası isimler
+    "name": ["name", "ürün adı", "urun adi", "ürün", "product", "product name"],
+    "barcode": ["barcode", "barkod", "code", "sku"],
+    "price": ["price", "fiyat", "satış fiyatı", "satis fiyati", "unit price"],
+    "stock": ["stock", "stok", "quantity", "qty", "adet"],
+    "description": ["description", "açıklama", "aciklama", "desc", "notes", "note"]
+}
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = {c: str(c).strip().lower() for c in df.columns}
+    df = df.rename(columns=cols)
+    # duplicate/nan kolon temizliği
+    df = df.loc[:, ~df.columns.str.contains(r"^unnamed|^nan$", case=False, na=False)]
+    # hedef kolon isimlerini bul
+    target = {}
+    for target_col, candidates in PRODUCTS_COL_MAP.items():
+        for cand in candidates:
+            if cand in df.columns:
+                target[target_col] = cand
+                break
+    # olmayanlara varsayılan kolon ekle
+    for key in ["name","barcode","price","stock","description"]:
+        if key not in target:
+            df[key] = None
+    # yalnızca hedef kolonları sırala
+    out = pd.DataFrame({
+        "name": df.get(target.get("name","name"), None),
+        "barcode": df.get(target.get("barcode","barcode"), None),
+        "price": df.get(target.get("price","price"), 0),
+        "stock": df.get(target.get("stock","stock"), 0),
+        "description": df.get(target.get("description","description"), None),
+    })
+    # tip dönüşümleri
+    out["name"] = out["name"].astype(str).str.strip()
+    out["barcode"] = out["barcode"].astype(str).str.strip().replace({"None": None, "nan": None})
+    # fiyat: 1.234,56 → 1234.56
+    out["price"] = (
+        out["price"].astype(str)
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    out["price"] = pd.to_numeric(out["price"], errors="coerce").fillna(0.0)
+    out["stock"] = pd.to_numeric(out["stock"], errors="coerce").fillna(0).astype(int)
+    out["description"] = out["description"].fillna("").astype(str).str.strip()
+    # boş isimleri ele
+    out = out[out["name"].str.len() > 0]
+    return out.reset_index(drop=True)
+
+def import_products_from_excel(file) -> pd.DataFrame:
+    raw = pd.read_excel(file)
+    norm = _normalize_columns(raw)
+    results = []
+    for _, r in norm.iterrows():
+        try:
+            pid = add_product(
+                name=r["name"],
+                barcode=(None if r["barcode"] in (None, "", "None", "nan") else r["barcode"]),
+                price=float(r["price"]),
+                stock=int(r["stock"]),
+                description=r["description"]
+            )
+            results.append({"name": r["name"], "status": "OK", "id": pid})
+        except sqlite3.IntegrityError as e:
+            results.append({"name": r["name"], "status": f"SKIP (duplicate barcode)"})
+        except Exception as e:
+            results.append({"name": r["name"], "status": f"ERROR: {e}"})
+    return pd.DataFrame(results)
+
+def export_products_to_excel(include_inactive: bool = False) -> BytesIO:
+    df = list_products(include_inactive=include_inactive)
+    # Excel'e yaz
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Products", index=False)
+    bio.seek(0)
+    return bio
+
+
+# Kullanıcı listesi (şimdilik sabit)
+# Kullanıcı listesi (.env'den)
 import os
 
-# Güvenli sayfa ayarı (varsa sorun çıkarmaz)
-try:
-    st.set_page_config(page_title="Loris WMS – Pro", layout="wide")
-except Exception:
-    pass
+def _env_user(user_key: str, pass_key: str, role: str):
+    """ .env içinden kullanıcıyı okuyup sözlüğe dönüştürür """
+    u = os.getenv(user_key, "").strip()
+    p = os.getenv(pass_key, "").strip()
+    if u and p:
+        return {u: {"password": p, "role": role}}
+    return {}
 
-# experimental_rerun uyumluluğu
-if hasattr(st, "rerun") and not hasattr(st, "experimental_rerun"):
-    st.experimental_rerun = st.rerun
+USERS = {}
+# admin1 (varsa)
+USERS.update(_env_user("ADMIN1_USER", "ADMIN1_PASS", "admin"))
 
-# Dizinler
-BASE = Path(__file__).parent
-WRITABLE = Path(os.getenv("STREAMLIT_DATA_DIR", "/mount/data"))
-WRITABLE.mkdir(parents=True, exist_ok=True)
+# merve = personel
+USERS.update(_env_user("MERVE_USER", "MERVE_PASS", "personel"))
 
-# --- pandas güvenli sarmalayıcılar ---
-import pandas as pd
+# ali = admin
+USERS.update(_env_user("ALI_USER", "ALI_PASS", "admin"))
 
-if not hasattr(pd, "_orig_to_datetime"):
-    pd._orig_to_datetime = pd.to_datetime
-    def _safe_to_datetime(arg, *a, **k):
-        k.setdefault("errors", "coerce")
-        k.setdefault("dayfirst", True)
-        return pd._orig_to_datetime(arg, *a, **k)
-    pd.to_datetime = _safe_to_datetime
+# mehmet = admin
+USERS.update(_env_user("MEHMET_USER", "MEHMET_PASS", "admin"))
 
-if not hasattr(pd, "_orig_read_excel"):
-    pd._orig_read_excel = pd.read_excel
-    def _safe_read_excel(x, *a, **k):
-        from io import BytesIO
-        try:
-            return pd._orig_read_excel(x, *a, **k)
-        except FileNotFoundError:
-            p = Path(str(x))
-            for c in (BASE / p, BASE / p.name):
-                if c.exists():
-                    return pd._orig_read_excel(c, *a, **k)
-            if hasattr(x, "read"):
-                try:
-                    return pd._orig_read_excel(BytesIO(x.read()), *a, **k)
-                except Exception:
-                    pass
-            st.warning(f"Excel not found on Cloud: {x}")
-            return pd.DataFrame()
-    pd.read_excel = _safe_read_excel
-
-if not hasattr(pd, "_orig_read_csv"):
-    pd._orig_read_csv = pd.read_csv
-    def _safe_read_csv(x, *a, **k):
-        from io import StringIO, BytesIO
-        try:
-            return pd._orig_read_csv(x, *a, **k)
-        except FileNotFoundError:
-            p = Path(str(x))
-            for c in (BASE / p, BASE / p.name):
-                if c.exists():
-                    return pd._orig_read_csv(c, *a, **k)
-            if hasattr(x, "read"):
-                try:
-                    data = x.read()
-                    try:
-                        return pd._orig_read_csv(StringIO(data.decode()), *a, **k)
-                    except Exception:
-                        return pd._orig_read_csv(BytesIO(data), *a, **k)
-                except Exception:
-                    pass
-            st.warning(f"CSV not found on Cloud: {x}")
-            return pd.DataFrame()
-    pd.read_csv = _safe_read_csv
-
-# --- sqlite'i yazılabilir klasöre yönlendir ---
-import sqlite3 as _sqlite3
-if not hasattr(_sqlite3, "_orig_connect"):
-    _sqlite3._orig_connect = _sqlite3.connect
-    def _safe_connect(db, *a, **k):
-        if not db or str(db) == ":memory:":
-            return _sqlite3._orig_connect(db, *a, **k)
-        p = Path(db)
-        if not p.is_absolute() or str(p).startswith(str(BASE)):
-            # repo içine yazmaya çalışma; Cloud'da /mount/data yazılabilir
-            return _sqlite3._orig_connect(WRITABLE / p.name, *a, **k)
-        return _sqlite3._orig_connect(db, *a, **k)
-    _sqlite3.connect = _safe_connect
-# ==== END CLOUD PATCH ====
-
-
-# ==================== Cloud Compatibility Patch (auto-injected) ====================
-# This block keeps your original code intact and only adds safe fallbacks for Streamlit Cloud.
-
-# 1) Ensure page config is set early (ignored if already set later)
-try:
-    import streamlit as st
-    _st_compat = st  # alias to avoid shadowing
-    _st_compat.set_page_config(page_title="Loris WMS – Pro", layout="wide")
-
-    _st_compat.set_page_config(page_title="Loris WMS - Pro", layout="wide")
-except Exception:
-    pass
-
-# 2) Provide compatibility for deprecated st.experimental_rerun()
-try:
-    if hasattr(st, "rerun") and not hasattr(st, "experimental_rerun"):
-        st.experimental_rerun = st.rerun
-except Exception:
-    pass
-
-# 3) Safe pandas helpers to avoid crashes on Cloud
-try:
-    import pandas as pd
-    from pathlib import Path as _Path
-    from io import BytesIO as _BytesIO
-
-    BASE = _Path(__file__).parent
-
-    # Wrap to_datetime to default to safe options if not provided
-    if not hasattr(pd, "_original_to_datetime"):
-        pd._original_to_datetime = pd.to_datetime
-        def _safe_to_datetime(arg, *args, **kwargs):
-            kwargs.setdefault("errors", "coerce")
-            kwargs.setdefault("dayfirst", True)
-            return pd._original_to_datetime(arg, *args, **kwargs)
-        pd.to_datetime = _safe_to_datetime
-
-    # Wrap read_excel to try relative paths and avoid hard crashes
-    if not hasattr(pd, "_original_read_excel"):
-        pd._original_read_excel = pd.read_excel
-        def _safe_read_excel(x, *args, **kwargs):
-            # Try as-is first
-            try:
-                return pd._original_read_excel(x, *args, **kwargs)
-            except FileNotFoundError:
-                # Try relative to repo folder and filename-only fallback
-                try:
-                    p = _Path(str(x))
-                    candidates = [BASE / p, BASE / p.name]
-                    for c in candidates:
-                        if c.exists():
-                            return pd._original_read_excel(c, *args, **kwargs)
-                except Exception:
-                    pass
-                # Try bytes stream if a file-like was passed
-                try:
-                    if hasattr(x, "read"):
-                        return pd._original_read_excel(_BytesIO(x.read()), *args, **kwargs)
-                except Exception:
-                    pass
-                # Final fallback: empty DataFrame and gentle warning
-                try:
-                    import streamlit as st
-                    _st_warn = st
-                    _st_warn.warning(f"Excel not found on Cloud: {x}")
-                except Exception:
-                    pass
-                return pd.DataFrame()
-            except Exception:
-                # Any other error: re-raise to not mask real issues
-                return pd._original_read_excel(x, *args, **kwargs)
-        pd.read_excel = _safe_read_excel
-
-    # Similarly guard read_csv
-    if not hasattr(pd, "_original_read_csv"):
-        pd._original_read_csv = pd.read_csv
-        def _safe_read_csv(x, *args, **kwargs):
-            try:
-                return pd._original_read_csv(x, *args, **kwargs)
-            except FileNotFoundError:
-                try:
-                    p = _Path(str(x))
-                    candidates = [BASE / p, BASE / p.name]
-                    for c in candidates:
-                        if c.exists():
-                            return pd._original_read_csv(c, *args, **kwargs)
-                except Exception:
-                    pass
-                try:
-                    if hasattr(x, "read"):
-                        return pd._original_read_csv(_BytesIO(x.read()), *args, **kwargs)
-                except Exception:
-                    pass
-                try:
-                    import streamlit as st
-                    _st_warn2 = st
-                    _st_warn2.warning(f"CSV not found on Cloud: {x}")
-
-                except Exception:
-                    pass
-                import pandas as _pd
-                return _pd.DataFrame()
-        pd.read_csv = _safe_read_csv
-
-except Exception:
-    # Never block app start because of the helper patch
-    pass
-# ================== End of Cloud Compatibility Patch (auto-injected) =================
-
-import sqlite3, pandas as pd, numpy as np
-from datetime import date, datetime
-from io import BytesIO
-from pathlib import Path
-import matplotlib.pyplot as plt
-import re, uuid, os, shutil
-
-# =========================
-#  CONFIG & GLOBALS
-# =========================
-st.set_page_config(page_title="Loris WMS – Pro", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""<style>#MainMenu {visibility:hidden;} footer {visibility:hidden;} header {visibility:hidden;}</style>""", unsafe_allow_html=True)
-
-# ---- i18n ----
-LANGS = ["tr","en"]
-if "lang" not in st.session_state: st.session_state.lang = "tr"
-def t(key):
-    TR = {
-        # menu / common
-        "title": "📦 Loris WMS – Pro",
-        "menu_products": "Ürünler",
-        "menu_moves": "Stok Hareketleri",
-        "menu_sales": "Satışlar",
-        "menu_reports": "Raporlar",
-        "menu_imports": "İçe Aktarım Geçmişi",
-        "logout": "Çıkış Yap",
-        "settings": "Ayarlar",
-        "allow_negative": "Negatif stoğa izin ver",
-        "language": "Dil / Language",
-        "login": "Giriş",
-        "username": "Kullanıcı Adı",
-        "password": "Şifre",
-        "login_btn": "Giriş Yap",
-        "login_err": "Hatalı kullanıcı adı/şifre",
-
-        # products
-        "products_header": "Ürünler (Önizleme → Kaydet)",
-        "upload_products": "📂 Ürün Excel (Depo.xlsm/Ürünlerim)",
-        "preview_info": "Önizleme gösteriliyor; 'Kaydet' demeden veritabanına yazılmaz.",
-        "save": "💾 Kaydet",
-        "delete_preview": "🗑️ Sil (Önizleme)",
-        "products_updated": "Ürünler güncellendi ✅ Güncellenen:{u} | Yeni:{c} | İlk stok girişi:{s}",
-        "products_summary": "Ürün Özeti",
-        "search": "Ara",
-        "choose_cols": "Gösterilecek kolonlar",
-        "download_excel": "⬇️ Excel indir",
-
-        # moves
-        "moves_header": "Stok Hareketleri",
-        "start_date": "Başlangıç",
-        "end_date": "Bitiş",
-
-        # sales
-        "sales_header": "Satışlar (Önizleme → Kaydet / Sil / Undo)",
-        "upload_sales": "📂 Satış Excel (Satışlar/Sales)",
-        "auto_open_note": "Son yüklenen dosya otomatik açıldı.",
-        "preview_note": "Önizleme – tabloyu kontrol et. 'Kaydet' ile DB'ye yazılır.",
-        "save_db": "💾 Kaydet (DB'ye işle)",
-        "undo_last": "↩️ Undo (Son satış importu)",
-        "saved_ok": "✅ Kaydedildi",
-        "blocked_neg": "{n} satır NEGATİF stok nedeniyle engellendi (Ayarlar'dan izin verebilirsin).",
-        "bad_rows": "{n} satır ürün/adet/fiyat eksik olduğu için atlandı.",
-        "sales_archive": "📚 Önceden yüklenen satış dosyaları",
-        "file_select": "Dosya seç",
-        "preview_again": "📄 Önizle (tekrar)",
-        "reprocess": "♻️ Bu dosyayı yeniden işle (Kaydet)",
-        "delete_files": "🧹 Seçili dosyaları sil (Arşivden)",
-        "trash_mgr": "🗑️ Çöp kutusu",
-        "restore_sel": "⤴️ Seçiliyi geri getir",
-        "empty_trash": "🔥 Çöp kutusunu boşalt",
-        "preview_delete": "🗑️ Sil (Önizleme)",
-
-        # imports
-        "imports_header": "İçe Aktarım Geçmişi",
-        "imports_download": "⬇️ Excel indir (Geçmiş)",
-        "imports_select": "Seç ve Geri Al",
-        "imports_undo": "↩️ Seçili importu geri al",
-        "imports_done": "Geri alındı: {x}",
-
-        # reports
-        "reports_header": "Raporlar",
-        "stock_report": "Stok Durumu",
-        "download_stock": "⬇️ Excel indir (Stok)",
-        "top_pie": "En Çok Satan Ürünler (Pasta)",
-        "branch_bar": "Şube Bazlı Stok (Bar)",
-        "daily_sales_profit": "Günlük Satış & Kârlılık",
-    }
-    EN = {
-        "title": "📦 Loris WMS – Pro",
-        "menu_products": "Products",
-        "menu_moves": "Stock Movements",
-        "menu_sales": "Sales",
-        "menu_reports": "Reports",
-        "menu_imports": "Import History",
-        "logout": "Log out",
-        "settings": "Settings",
-        "allow_negative": "Allow negative stock",
-        "language": "Language",
-        "login": "Login",
-        "username": "Username",
-        "password": "Password",
-        "login_btn": "Sign in",
-        "login_err": "Wrong username or password",
-
-        "products_header": "Products (Preview → Save)",
-        "upload_products": "📂 Products Excel (Depo.xlsm/Ürünlerim)",
-        "preview_info": "Preview only; DB is not changed until you click Save.",
-        "save": "💾 Save",
-        "delete_preview": "🗑️ Delete (Preview)",
-        "products_updated": "Products updated ✅ Updated:{u} | New:{c} | Initial stock entries:{s}",
-        "products_summary": "Products Summary",
-        "search": "Search",
-        "choose_cols": "Visible columns",
-        "download_excel": "⬇️ Download Excel",
-
-        "moves_header": "Stock Movements",
-        "start_date": "Start",
-        "end_date": "End",
-
-        "sales_header": "Sales (Preview → Save / Delete / Undo)",
-        "upload_sales": "📂 Sales Excel (Satışlar/Sales)",
-        "auto_open_note": "Auto-opened the last uploaded file.",
-        "preview_note": "Preview – review table. Click 'Save' to write to DB.",
-        "save_db": "💾 Save (write to DB)",
-        "undo_last": "↩️ Undo (Last sales import)",
-        "saved_ok": "✅ Saved",
-        "blocked_neg": "{n} rows blocked due to NEGATIVE stock (toggle in Settings).",
-        "bad_rows": "{n} rows skipped due to missing product/qty/price.",
-        "sales_archive": "📚 Previously uploaded sales files",
-        "file_select": "Select file",
-        "preview_again": "📄 Preview again",
-        "reprocess": "♻️ Re-process this file (Save)",
-        "delete_files": "🧹 Delete selected files (Archive)",
-        "trash_mgr": "🗑️ Trash",
-        "restore_sel": "⤴️ Restore selected",
-        "empty_trash": "🔥 Empty trash",
-        "preview_delete": "🗑️ Delete (Preview)",
-
-        "imports_header": "Import History",
-        "imports_download": "⬇️ Download Excel (History)",
-        "imports_select": "Select & Undo",
-        "imports_undo": "↩️ Undo selected import",
-        "imports_done": "Undone: {x}",
-
-        "reports_header": "Reports",
-        "stock_report": "Stock Status",
-        "download_stock": "⬇️ Download Excel (Stock)",
-        "top_pie": "Top Sellers (Pie)",
-        "branch_bar": "Stock by Branch (Bar)",
-        "daily_sales_profit": "Daily Sales & Profit",
-    }
-    return (TR if st.session_state.lang=="tr" else EN).get(key, key)
-
-# Column display translations (no underscores)
-COLMAP_TR = {
-    "Product Name":"Ürün Adı","Unit":"Birim","Cost":"Alış Fiyatı","Price":"Satış Fiyatı","Shelf Price":"Raf Fiyatı",
-    "Stock":"Stok","Current Stock":"Mevcut Stok","Date":"Tarih","Customer":"Müşteri","Sale Price":"Satış Fiyatı",
-    "Cash":"Nakit","Card":"Kart","Piece":"Adet","Total Cash":"Nakit Toplam","Total Card":"Kart Toplam",
-    "General Total":"Genel Toplam","Note":"Note","Column1":"Column1","Payment_Type":"Ödeme Türü",
-    "Urun_Adi":"Ürün Adı","Birim":"Birim","Alış_Fiyatı":"Alış Fiyatı","Satış_Fiyatı":"Satış Fiyatı","Raf_Fiyatı":"Raf Fiyatı",
-    "Stok_Giriş":"Stok Giriş","Stok_Çıkış":"Stok Çıkış","Mevcut_Stok":"Mevcut Stok","Alış_Toplam":"Alış Toplam",
-    "Satış_Toplam":"Satış Toplam","Raf_Satış_Toplam":"Raf Satış Toplam","Ürün":"Ürün","Hareket_Tipi":"Hareket Tipi",
-    "Miktar":"Miktar","Notlar":"Notlar","Şube":"Şube","Toplam_Stok":"Toplam Stok"
-}
-COLMAP_EN = {
-    "Product Name":"Product Name","Unit":"Unit","Cost":"Cost","Price":"Price","Shelf Price":"Shelf Price",
-    "Stock":"Stock","Current Stock":"Current Stock","Date":"Date","Customer":"Customer","Sale Price":"Sale Price",
-    "Cash":"Cash","Card":"Card","Piece":"Piece","Total Cash":"Total Cash","Total Card":"Total Card",
-    "General Total":"General Total","Note":"Note","Column1":"Column1","Payment_Type":"Payment Type",
-    "Urun_Adi":"Product","Birim":"Unit","Alış_Fiyatı":"Cost","Satış_Fiyatı":"Price","Raf_Fiyatı":"Shelf Price",
-    "Stok_Giriş":"In","Stok_Çıkış":"Out","Mevcut_Stok":"Current Stock","Alış_Toplam":"Total Cost",
-    "Satış_Toplam":"Total Price","Raf_Satış_Toplam":"Total Shelf","Ürün":"Product","Hareket_Tipi":"Move Type",
-    "Miktar":"Qty","Notlar":"Notes","Şube":"Branch","Toplam_Stok":"Running Stock"
-}
-def localize_df(df: pd.DataFrame) -> pd.DataFrame:
-    mapper = COLMAP_TR if st.session_state.lang=="tr" else COLMAP_EN
-    return df.rename(columns={c: mapper.get(c, c).replace("_"," ") for c in df.columns})
-
-# ---- Settings in sidebar ----
-with st.sidebar.expander(t("settings"), True):
-    if "allow_negative" not in st.session_state: st.session_state.allow_negative = False
-    st.session_state.allow_negative = st.checkbox(t("allow_negative"), value=st.session_state.allow_negative)
-    st.session_state.lang = st.selectbox(t("language"), LANGS, index=LANGS.index(st.session_state.lang))
-
-# ---- Login (with Enter support via form submit) ----
-USERS = {"admin":"1234","personel":"0000"}
-if "logged_in" not in st.session_state: st.session_state.logged_in=False
-def do_login(user, pwd):
-    if user in USERS and USERS[user]==pwd:
-        st.session_state.logged_in=True
-        st.session_state.user=user
-    else:
-        st.session_state.login_error = t("login_err")
-
+# personel1 = personel
+USERS.update(_env_user("PERSON1_USER", "PERSON1_PASS", "personel"))
+# --- Session defaults (mutlaka tek kopya) ---
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "role" not in st.session_state:
+    st.session_state.role = None
+if "user" not in st.session_state:
+    st.session_state.user = None
+if "lang" not in st.session_state:
+    st.session_state.lang = "Türkçe"
+# Basit çeviri helper'ı
+T = lambda tr, en: tr if st.session_state.get("lang", "Türkçe") == "Türkçe" else en
+# Login ekranı
 if not st.session_state.logged_in:
-    st.sidebar.subheader("🔐 "+t("login"))
-    with st.sidebar.form("login_form"):
-        u = st.text_input(t("username"))
-        p = st.text_input(t("password"), type="password")
-        submitted = st.form_submit_button(t("login_btn"))
-    if submitted: do_login(u,p)
-    if st.session_state.get("login_error"): st.sidebar.error(st.session_state.login_error)
+    st.title("🔐 LORISWMS — Pilot Login")
+
+    # (Burada zaten dil seçiminiz var — bırakın)
+    # Örn: st.session_state.lang -> "Türkçe" / "English"
+
+    if st.session_state.lang == "Türkçe":
+        with st.form("login_form_tr", clear_on_submit=False):
+            username = st.text_input("Kullanıcı Adı", key="__login_user__")
+            password = st.text_input("Şifre", type="password", key="__login_pass__")
+            submitted_tr = st.form_submit_button("Giriş Yap")
+
+        if submitted_tr:
+            if username in USERS and USERS[username]["password"] == password:
+                st.session_state.logged_in = True
+                st.session_state.role = USERS[username]["role"]
+                st.session_state.user = username
+                st.success(f"Giriş başarılı! Hoş geldin, {username}")
+                st.rerun()
+            else:
+                st.error("Hatalı kullanıcı adı veya şifre")
+    else:
+        with st.form("login_form_en", clear_on_submit=False):
+            username = st.text_input("Username", key="__login_user__")
+            password = st.text_input("Password", type="password", key="__login_pass__")
+            submitted_en = st.form_submit_button("Login")
+
+        if submitted_en:
+            if username in USERS and USERS[username]["password"] == password:
+                st.session_state.logged_in = True
+                st.session_state.role = USERS[username]["role"]
+                st.session_state.user = username
+                st.success(f"Login successful! Welcome, {username}")
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+    # 🔴 ÖNEMLİ: Giriş yapılmadıysa uygulamanın geri kalanını ÇİZME
     st.stop()
 
-# =========================
-#  DB & SCHEMA
-# =========================
-conn = sqlite3.connect("test.db", check_same_thread=False)
-conn.execute("PRAGMA foreign_keys = ON")
-cur = conn.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS products(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT UNIQUE, unit TEXT, cost REAL, price REAL, shelf_price REAL
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS movements(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  product_id INTEGER, date TEXT, type TEXT CHECK(type IN('IN','OUT')),
-  quantity REAL, note TEXT, branch TEXT, import_id TEXT,
-  FOREIGN KEY(product_id) REFERENCES products(id)
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS orders(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  customer TEXT, date TEXT, status TEXT, payment_type TEXT CHECK(payment_type IN('Cash','Card','')),
-  import_id TEXT
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS order_lines(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  order_id INTEGER, product_id INTEGER, quantity REAL, unit_price REAL, unit_cost REAL DEFAULT 0,
-  import_id TEXT,
-  FOREIGN KEY(order_id) REFERENCES orders(id),
-  FOREIGN KEY(product_id) REFERENCES products(id)
-)""")
-cur.execute("""CREATE TABLE IF NOT EXISTS imports(
-  id TEXT PRIMARY KEY, kind TEXT, filename TEXT, ts TEXT
-)""")
-def ensure_column(table, col, decl):
-    have=[r[1] for r in cur.execute(f"PRAGMA table_info('{table}')")]
-    if col not in have: cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-ensure_column("movements","import_id","TEXT")
-ensure_column("orders","import_id","TEXT")
-ensure_column("order_lines","import_id","TEXT")
-conn.commit()
+else:
+    # --- Üst bilgi ---
+    role = st.session_state.role or "admin"
+    user = st.session_state.user or "admin1"
+    st.sidebar.title(T(f"Merhaba, {user} ({role})", f"Hello, {user} ({role})"))
 
-# =========================
-#  Helpers
-# =========================
-UPLOAD_DIR = Path("Uploads"); TRASH_DIR = Path("Uploads/_trash")
-for p in [UPLOAD_DIR/"sales", UPLOAD_DIR/"products", TRASH_DIR/"sales", TRASH_DIR/"products"]:
-    p.mkdir(parents=True, exist_ok=True)
+    # --- Dil seçimi (girişten sonra) ---
+    st.sidebar.markdown("### 🌐 " + T("Dil / Language", "Language"))
+    new_lang = st.sidebar.radio(
+        "",
+        ["Türkçe", "English"],
+        index=0 if st.session_state.lang == "Türkçe" else 1,
+        key="__lang_after__",
+    )
+    if new_lang != st.session_state.lang:
+        st.session_state.lang = new_lang
+        st.rerun()
 
-def nk(s:str)->str:
-    if s is None: return ""
-    s=str(s).strip().lower()
-    s=s.translate(str.maketrans("çğıöşüı ", "cgiosui_"))
-    s=re.sub(r"[^a-z0-9_]", "", s)
-    return re.sub(r"_+","_",s)
-
-CANON = {
-    "date":"Date","tarih":"Date","customer":"Customer","musteri":"Customer",
-    "productname":"Product Name","urunadi":"Product Name","urun_ad":"Product Name","urun":"Product Name","product":"Product Name",
-    "unit":"Unit","birim":"Unit","cost":"Cost","maliyet":"Cost","alis_fiyati":"Cost","alisfiyati":"Cost",
-    "price":"Price","satisfiyati":"Price","satisfiyat":"Price","shelfprice":"Shelf Price","raf_fiyati":"Shelf Price",
-    "raffiyati":"Shelf Price","stock":"Stock","stok":"Stock","mevcut_stok":"Stock",
-    "currentstock":"Current Stock","saleprice":"Sale Price","birimfiyat":"Sale Price","fiyat":"Sale Price",
-    "cash":"Cash","nakit":"Cash","card":"Card","kart":"Card","pos":"Card",
-    "piece":"Piece","adet":"Piece","miktar":"Piece","quantity":"Piece",
-    "totalcash":"Total Cash","total_card":"Total Card","totalcard":"Total Card",
-    "generaltotal":"General Total","geneltoplam":"General Total","note":"Note","not":"Note","column1":"Column1"
-}
-REQ_SALES=["Date","Customer","Product Name","Piece","Sale Price","Cash","Card","Note","Column1"]
-REQ_PROD=["Product Name","Unit","Cost","Price","Shelf Price","Stock"]
-
-def normalize_columns(df: pd.DataFrame)->pd.DataFrame:
-    mapping={}
-    for c in df.columns:
-        k=nk(c)
-        if k in CANON: mapping[c]=CANON[k]
-    return df.rename(columns=mapping)
-
-def manual_mapper(df: pd.DataFrame, required: list, key:str):
-    st.warning("Kolon eşlemesi gerekiyor." if st.session_state.lang=="tr" else "Column mapping required.")
-    candidates=list(df.columns)
-    mapping={}
-    cols=st.columns(2)
-    for i,need in enumerate(required):
-        with cols[i%2]:
-            mapping[need]=st.selectbox(f"→ {need}", ["(seç)"]+candidates, index=0, key=f"map_{key}_{need}")
-    if st.button("Eşlemeyi Uygula" if st.session_state.lang=="tr" else "Apply Mapping", key=f"apply_{key}"):
-        chosen={need:m for need,m in mapping.items() if m and m!="(seç)"}
-        if len(chosen)>=2:
-            df2=pd.DataFrame()
-            for need,src in chosen.items(): df2[need]=df[src]
-            st.success("Eşleme uygulandı." if st.session_state.lang=="tr" else "Mapping applied.")
-            return df2
-        st.error("En az 2 kolon eşle." if st.session_state.lang=="tr" else "Map at least 2 columns.")
-    return None
-
-def save_upload(uploaded_file, kind:str)->Path:
-    ts=datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe=re.sub(r"[^A-Za-z0-9_.-]+","_", uploaded_file.name)
-    path=UPLOAD_DIR/kind/f"{ts}__{safe}"
-    with open(path,"wb") as f: f.write(uploaded_file.getbuffer())
-    return path
-
-def df_to_excel_bytes(df: pd.DataFrame, sheet="Sheet1")->bytes:
-    buf=BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        df.to_excel(xw, index=False, sheet_name=sheet)
-    return buf.getvalue()
-
-def mini_archive(kind:str, sheets:list, required_cols:list, limit:int=3):
-    """Show a tiny expander with last N uploaded files for given kind ('sales'/'products')."""
-    try:
-        files = sorted((UPLOAD_DIR/kind).glob("*"))
-        files = files[-limit:]
-        if not files:
-            return
-        title = "📂 Son 3 yükleme (mini)" if st.session_state.get("lang","tr")=="tr" else "📂 Last 3 uploads (mini)"
-        with st.expander(title, expanded=False):
-            for p in files:
-                c1,c2,c3 = st.columns([8,1,1])
-                with c1:
-                    st.caption(p.name)
-                with c2:
-                    if st.button("📄", key=f"mini_prev_{kind}_{p.name}"):
-                        try:
-                            dfv = smart_read(p, sheets, required_cols)
-                            st.dataframe(localize_df(dfv.head(10)), use_container_width=True)
-                        except Exception as e:
-                            st.error(str(e))
-                with c3:
-                    if st.button("🗑️", key=f"mini_del_{kind}_{p.name}"):
-                        try:
-                            dst = TRASH_DIR/kind/p.name
-                            dst.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(p), str(dst))
-                        except Exception as e:
-                            st.error(str(e))
-                        st.rerun()
-    except Exception as e:
-        st.error(str(e))
-
-def parse_number(x):
-    if pd.isna(x): return None
-    s=str(x).strip()
-    if s=="": return None
-    s=s.replace("TL","").replace("₺","").replace("$","").replace("€","").strip()
-    if re.search(r",\d{1,2}$", s) and s.count(",")==1:
-        s=s.replace(".","").replace(",",".")
-    else:
-        if s.count(".")>1 and "," not in s: s=s.replace(".","")
-        s=s.replace(",","")
-    try: return float(s)
-    except: return None
-
-def numberize(df: pd.DataFrame, cols)->pd.DataFrame:
-    for c in cols:
-        if c in df.columns: df[c]=df[c].apply(parse_number).fillna(0.0)
-    return df
-
-def drop_empty_rows(df: pd.DataFrame, keys:list)->pd.DataFrame:
-    keys=[c for c in keys if c in df.columns]
-    if not keys: return df.iloc[0:0]
-    mask=pd.Series(False, index=df.index)
-    for c in keys:
-        mask |= (~df[c].astype(str).str.strip().isin(["","0","0.0","nan"]))
-    return df[mask]
-
-def smart_read(path, sheets, required):
-    """
-    Excel dosyasını açar, doğru sheet'i bulur, başlık satırını otomatik tespit eder.
-    """
-    xls = pd.ExcelFile(path)
-
-    # Sheet seçimi (Sales / Satışlar vs.)
-    target_sheet = None
-    for name in xls.sheet_names:
-        if any(s.lower() in name.lower() for s in sheets):
-            target_sheet = name
-            break
-    if target_sheet is None:
-        target_sheet = xls.sheet_names[0]
-
-    # Önizleme ile başlık satırını bul
-    preview = pd.read_excel(xls, sheet_name=target_sheet, header=None, nrows=10)
-    header_row = None
-    for i, row in preview.iterrows():
-        values = [str(v).strip().lower() for v in row.values if pd.notna(v)]
-        found = sum(any(req.lower() in v for v in values) for req in required)
-        if found >= 2:
-            header_row = i
-            break
-    if header_row is None:
-        raise ValueError("Satışlar sheet'inde başlık satırı bulunamadı")
-
-    # Artık doğru başlıkla oku
-    df = pd.read_excel(xls, sheet_name=target_sheet, header=header_row)
-
-    # Kolon adlarını normalize et
-    df.columns = [str(c).strip() for c in df.columns]
-
-    return df
-
-    # fallback
-    df=pd.read_excel(xls)
-    return normalize_columns(df)
-
-def get_current_stock(pid:int)->float:
-    val=conn.execute("""
-      SELECT COALESCE(SUM(CASE WHEN type='IN' THEN quantity ELSE -quantity END),0)
-      FROM movements WHERE product_id=?""",(pid,)).fetchone()
-    return float(val[0]) if val and val[0] is not None else 0.0
-
-# =========================
-#  UI – MENU
-# =========================
-st.title(t("title"))
-if st.sidebar.button(t("logout")):
-    st.session_state.logged_in=False; st.rerun()
-
-menu_admin=[t("menu_products"), t("menu_moves"), t("menu_sales"), t("menu_reports"), t("menu_imports")]
-menu_user=[t("menu_moves"), t("menu_reports")]
-choice=st.sidebar.radio("Menü", menu_admin if st.session_state.user=="admin" else menu_user)
-
-# =========================
-#  PRODUCTS
-# =========================
-if choice==t("menu_products"):
-    st.header(t("products_header"))
-    up = st.file_uploader(t("upload_products"), type=["xls","xlsx","xlsm"], key="prod_up")
-    if up:
-        st.info(t("preview_info"))
-        path = save_upload(up, "products")
-        dfp = smart_read(path, ["Ürünlerim","Ürünler","Products"], REQ_PROD)
-
-        if len(set(REQ_PROD) & set(dfp.columns)) < 3:
-            manual = manual_mapper(dfp, REQ_PROD, "products")
-            if manual is not None: dfp = manual
-
-        dfp = numberize(dfp, ["Cost","Price","Shelf Price","Stock"])
-        st.dataframe(localize_df(dfp), use_container_width=True)
-
-        col1,col2 = st.columns([1,1])
-        if col1.button(t("save"), key="prod_save"):
-            updated=created=stocked=0
-            for _, r in dfp.iterrows():
-                name=str(r.get("Product Name","")).strip()
-                if not name: continue
-                unit=str(r.get("Unit","Adet")).strip()
-                cost=float(r.get("Cost",0)); price=float(r.get("Price",0)); shelf=float(r.get("Shelf Price",0))
-                init=float(r.get("Stock",0))
-                cur.execute("SELECT id FROM products WHERE name=?", (name,))
-                row=cur.fetchone()
-                if row:
-                    pid=row[0]
-                    cur.execute("UPDATE products SET unit=?,cost=?,price=?,shelf_price=? WHERE id=?",
-                                (unit,cost,price,shelf,pid))
-                    updated+=1
-                else:
-                    cur.execute("INSERT INTO products(name,unit,cost,price,shelf_price) VALUES(?,?,?,?,?)",
-                                (name,unit,cost,price,shelf))
-                    pid=cur.lastrowid; created+=1
-                if init:
-                    imp_id=str(uuid.uuid4())
-                    cur.execute("INSERT INTO movements(product_id,date,type,quantity,note,branch,import_id) VALUES(?,?,?,?,?,?,?)",
-                                (pid, str(date.today()), "IN", init, "Initial stock (Excel)", "Main Warehouse", imp_id))
-                    cur.execute("INSERT INTO imports(id,kind,filename,ts) VALUES(?,?,?,?)",
-                                (imp_id,"products", path.name, datetime.now().isoformat(timespec="seconds")))
-                    stocked+=1
-            conn.commit()
-            st.success(t("products_updated").format(u=updated,c=created,s=stocked))
-        if col2.button(t("delete_preview"), key="prod_del"):
-            try: os.remove(path)
-            except: pass
-            st.rerun()
-
-    st.subheader(t("products_summary"))
-    search = st.text_input(t("search"))
-    q = """
-    SELECT p.id,
-           p.name AS Ürün_Adı, p.unit AS Birim, p.cost AS Alış_Fiyatı, p.price AS Satış_Fiyatı, p.shelf_price AS Raf_Fiyatı,
-           IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='IN'),0)  AS Stok_Giriş,
-           IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='OUT'),0) AS Stok_Çıkış,
-           (IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='IN'),0) -
-            IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='OUT'),0)) AS Mevcut_Stok,
-           ((IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='IN'),0) -
-             IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='OUT'),0)) * p.cost)        AS Alış_Toplam,
-           ((IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='IN'),0) -
-             IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='OUT'),0)) * p.price)       AS Satış_Toplam,
-           ((IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='IN'),0) -
-             IFNULL((SELECT SUM(m.quantity) FROM movements m WHERE m.product_id=p.id AND m.type='OUT'),0)) * p.shelf_price) AS Raf_Satış_Toplam
-    FROM products p ORDER BY p.name
-    """
-    dfp2 = pd.read_sql(q, conn)
-    if search: dfp2 = dfp2[dfp2["Ürün_Adı"].str.contains(search, case=False, na=False)]
-    cols_all=list(dfp2.columns)
-    show_cols=st.multiselect(t("choose_cols"), cols_all, default=cols_all, key="prod_cols")
-    st.dataframe(localize_df(dfp2[show_cols]), use_container_width=True)
-    st.download_button(t("download_excel"), df_to_excel_bytes(dfp2[show_cols], "Products"),
-                       file_name="products_report.xlsx")
-
-# =========================
-#  MOVEMENTS
-# =========================
-elif choice==t("menu_moves"):
-    st.header(t("moves_header"))
-    date_from = st.date_input(t("start_date"), value=date(2024,1,1))
-    date_to   = st.date_input(t("end_date"), value=date.today())
-    df = pd.read_sql("""
-      SELECT m.id, p.name AS Ürün, m.date AS Tarih, m.type AS Hareket_Tipi, m.quantity AS Miktar, m.note AS Notlar, m.branch AS Şube
-      FROM movements m JOIN products p ON p.id=m.product_id
-      ORDER BY m.date DESC, m.id DESC
-    """, conn)
-    df["Tarih"] = pd.to_datetime(df["Tarih"], errors="coerce", dayfirst=True)
-    df = df[(df["Tarih"]>=pd.to_datetime(date_from)) & (df["Tarih"]<=pd.to_datetime(date_to))]
-    cols_all=list(df.columns)
-    show_cols=st.multiselect(t("choose_cols"), cols_all, default=cols_all, key="mov_cols")
-    st.dataframe(localize_df(df[show_cols]), use_container_width=True)
-    st.download_button(t("download_excel"), df_to_excel_bytes(df[show_cols], "Movements"), file_name="movements.xlsx")
-
-# =========================
-#  SALES
-# =========================
-
-    # Mini archive (last uploads)
-    try:
-        mini_archive("products", ["Ürünlerim","Ürünler","Products"], REQ_PROD, limit=3)
-    except Exception:
-        pass
-elif choice==t("menu_sales"):
-    st.header(t("sales_header"))
-
-    # 1) Auto open last uploaded file preview (if exists and no new upload yet)
-    sales_dir = UPLOAD_DIR/"sales"
-    uploaded_files = sorted(sales_dir.glob("*"))
-    last_file = uploaded_files[-1] if uploaded_files else None
-
-    # Upload area
-    up = st.file_uploader(t("upload_sales"), type=["xls","xlsx","xlsm"], key="sales_up")
-    preview_df=None; current_path=None
-
-    # If new upload, use it; else use last file if exists
-    if up:
-        current_path = save_upload(up, "sales")
-    elif last_file:
-        current_path = last_file
-        st.info(t("auto_open_note"))
-
-    if current_path:
-        df = smart_read(current_path, ["Sales","Satışlar","Satislar","SATISLAR"], REQ_SALES)
-        if len(set(REQ_SALES) & set(df.columns)) < 3:
-            manual = manual_mapper(df, REQ_SALES, "sales")
-            if manual is not None: df = manual
-
-        df = drop_empty_rows(df, ["Product Name","Piece","Sale Price"])
-        df = numberize(df, ["Piece","Sale Price","Note","Column1"])
-
-        # NOTE & COLUMN1: preserve if present; else fill
-        products_df = pd.read_sql("SELECT id,name,cost FROM products", conn)
-        id_map = dict(zip(products_df["name"], products_df["id"]))
-        cost_map = dict(zip(products_df["name"], products_df["cost"]))
-        df["Note"] = df.apply(lambda r: (r["Note"] if float(r["Note"])>0 else cost_map.get(str(r.get("Product Name","")).strip(),0.0)), axis=1)
-        df["Column1"] = df.apply(lambda r: (r["Column1"] if float(r["Column1"])>0 else r["Note"]*r["Piece"]), axis=1)
-
-        # Payment rule
-        def detect_payment(r):
-            cash_txt=str(r.get("Cash","")).strip()
-            return "Cash" if cash_txt not in ["","0","0.0","nan"] else "Card"
-        df["Payment_Type"]=df.apply(detect_payment, axis=1)
-
-        preview_df=df.copy()
-        st.caption(f"Current file: {Path(current_path).name}")
-        st.info(t("preview_note"))
-        st.dataframe(localize_df(preview_df), use_container_width=True)
-
-        c1,c2,c3 = st.columns([1,1,1])
-
-        if c1.button(t("save_db"), key="sales_save"):
-            imp_id=str(uuid.uuid4())
-            cur.execute("INSERT INTO imports(id,kind,filename,ts) VALUES(?,?,?,?)",
-                        (imp_id,"sales", Path(current_path).name, datetime.now().isoformat(timespec="seconds")))
-            blocked=bad=0
-            for _, r in preview_df.iterrows():
-                name=str(r.get("Product Name","")).strip()
-                piece=float(r.get("Piece",0)); price=float(r.get("Sale Price",0))
-                if not name or piece<=0 or price<=0:
-                    bad+=1; continue
-                row=cur.execute("SELECT id,cost FROM products WHERE name=?",(name,)).fetchone()
-                if row: pid=row[0]; cost_val=float(row[1])
-                else:
-                    pid=None; cost_val=float(r["Note"])
-                    cur.execute("INSERT INTO products(name,unit,cost,price,shelf_price) VALUES(?,?,?,?,?)",
-                                (name,"Adet",cost_val,price,price))
-                    pid=cur.lastrowid
-                stock_before=get_current_stock(pid)
-                if (stock_before - piece) < 0 and not st.session_state.allow_negative:
-                    blocked+=1; continue
-                d=pd.to_datetime(r.get("Date"), errors="coerce")
-                date_str=d.date().isoformat() if not pd.isna(d) else str(date.today())
-                cur.execute("INSERT INTO orders(customer,date,status,payment_type,import_id) VALUES(?,?,?,?,?)",
-                            (str(r.get("Customer","")), date_str, "Completed", r["Payment_Type"], imp_id))
-                oid=cur.lastrowid
-                cur.execute("INSERT INTO order_lines(order_id,product_id,quantity,unit_price,unit_cost,import_id) VALUES(?,?,?,?,?,?)",
-                            (oid,pid,piece,price,float(r["Note"]),imp_id))
-                cur.execute("INSERT INTO movements(product_id,date,type,quantity,note,branch,import_id) VALUES(?,?,?,?,?,?,?)",
-                            (pid,date_str,"OUT",piece,"Sale Excel Upload","Main Warehouse",imp_id))
-            conn.commit()
-            st.success(t("saved_ok"))
-            if blocked>0: st.warning(t("blocked_neg").format(n=blocked))
-            if bad>0: st.info(t("bad_rows").format(n=bad))
-
-        if c2.button(t("preview_delete"), key="sales_del"):
-            # move to trash instead of permanent delete
-            TRASH_DIR.mkdir(parents=True, exist_ok=True)
-            dst = TRASH_DIR/"sales"/Path(current_path).name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            try: shutil.move(str(current_path), str(dst))
-            except Exception: pass
-            st.rerun()
-
-        if c3.button(t("undo_last"), key="sales_undo"):
-            row=cur.execute("SELECT id FROM imports WHERE kind='sales' ORDER BY ts DESC LIMIT 1").fetchone()
-            if row:
-                last=row[0]
-                cur.execute("DELETE FROM order_lines WHERE import_id=?", (last,))
-                cur.execute("DELETE FROM movements   WHERE import_id=?", (last,))
-                cur.execute("DELETE FROM orders      WHERE import_id=?", (last,))
-                cur.execute("DELETE FROM imports     WHERE id=?", (last,))
-                conn.commit()
-                st.success(f"Undo: {last}")
+    st.sidebar.markdown("---")
+    # Yedek butonu: SADECE admin görsün, personel görmesin
+    if (st.session_state.role or "admin") == "admin":
+        with st.sidebar.expander(T("Yönetici araçları", "Admin tools"), expanded=False):
+            from pathlib import Path
+            dbp = Path(DB_PATH)
+            st.caption(T("Tam yedek indirme yalnızca yönetici içindir.", "Full backup is admin-only."))
+            if dbp.exists():
+                with open(dbp, "rb") as f:
+                    st.download_button(
+                        label=T("Veritabanı yedeğini indir", "Download database backup"),
+                        data=f.read(),
+                        file_name=f"loris_{datetime.now():%Y%m%d_%H%M%S}.db",
+                        mime="application/octet-stream",
+                        key="dl_db_prof",
+                    )
             else:
-                st.info("Geri alınacak satış importu yok." if st.session_state.lang=="tr" else "No sales import to undo.")
+                st.caption(T("Veritabanı bulunamadı", "No database found"))
+    # else: personel için hiçbir şey göstermiyoruz
+        
+    # --- Rol bazlı menü (tek kod, T() ile çeviri) ---
+    menu_items_admin = [
+        T("Ürünler", "Products"),
+        T("Stoklar", "Stocks"),
+        T("Satışlar", "Sales"),
+        T("Raporlar", "Reports"),
+        T("Çıkış", "Logout"),
+    ]
+    menu_items_personel = [
+        T("Stoklar", "Stocks"),
+        T("Raporlar", "Reports"),
+        T("Çıkış", "Logout"),
+    ]
 
-    # Archive manager
+    menu = st.sidebar.radio(
+        T("Menü", "Menu"),
+        menu_items_admin if role == "admin" else menu_items_personel,
+        key="__menu__",
+    )
+
+    # --- Çıkış ---
+    if menu == T("Çıkış", "Logout"):
+        st.session_state.logged_in = False
+        st.session_state.role = None
+        st.session_state.user = None
+        st.rerun()
+
+
+    # Menü içerikleri (şimdilik boş sayfalar)
+    if menu == T("Ürünler", "Products"):
+        st.header("📦 Ürünler")
+
+     # --- Ürünleri listele ---
+        st.subheader("📋 Ürün Listesi")
+        search_term = st.text_input("🔍 Ürün adı ile ara")
+
+        df = pd.read_sql("SELECT * FROM products", get_conn())
+        if search_term:
+            df = df[df["name"].str.contains(search_term, case=False, na=False)]
+
+
+        if not df.empty:
+            # Gri kolonları hesapla
+            df["Stok"] = df["stock_in"] - df["stock_out"]
+            df["Alış Toplam"] = df["Stok"] * df["cost"]
+            df["Satış Toplam"] = df["Stok"] * df["price"]
+            df["Raf Satış Toplam"] = df["Stok"] * df["shelf_price"]
+
+            # 12 kolon sırası
+            df = df[["name", "unit", "cost", "price", "shelf_price",
+                    "stock_in", "stock_out", "Stok",
+                    "Alış Toplam", "Satış Toplam", "Raf Satış Toplam", "notes"]]
+
+            st.dataframe(df, use_container_width=True)
+
+            # Excel export
+            out = BytesIO()
+            with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Ürünler")
+            st.download_button("📤 Excel indir",
+                            out.getvalue(),
+                            file_name="urunler.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("Henüz ürün yok.")
+
+        # --- Excel'den ürün yükleme ---
+        st.subheader("📥 Excel'den Yükle")
+        file = st.file_uploader("Excel seç (.xls, .xlsx, .xlsm)", type=["xls", "xlsx", "xlsm"])
+        if file:
+            try:
+                # Sadece "Ürünlerim" sheetini oku
+                df_upload = pd.read_excel(file, sheet_name="Ürünlerim")
+
+                # Kolon adlarını normalize et
+                def normalize(col):
+                    return (str(col)
+                            .lower()
+                            .replace("(", "")
+                            .replace(")", "")
+                            .replace("₺", "")
+                            .replace("£", "")
+                            .replace("$", "")
+                            .replace(".", "")
+                            .strip())
+
+                rename_map = {
+                    "product name": "name", "ürün adı": "name", "urun adi": "name",
+                    "unit": "unit", "birim": "unit",
+                    "cost": "cost", "maliyet": "cost",
+                    "price": "price", "satış fiyatı": "price", "satis fiyati": "price",
+                    "shelf price": "shelf_price", "shelf pric": "shelf_price", "raf fiyatı": "shelf_price",
+                    "stok girişi": "stock_in", "stok girisi": "stock_in", "stock in": "stock_in",
+                    "stok çıkışı": "stock_out", "stok cikisi": "stock_out", "stock out": "stock_out",
+                    "notes": "notes", "not": "notes"
+                }
+
+                df_upload = df_upload.rename(
+                    columns={c: rename_map.get(normalize(c), c) for c in df_upload.columns}
+                )
+
+                # Sadece bizim istediğimiz kolonlar varsa onları seç
+                keep_cols = ["name", "unit", "cost", "price", "shelf_price",
+                            "stock_in", "stock_out", "notes"]
+                df_upload = df_upload[[c for c in df_upload.columns if c in df_upload.columns and c in keep_cols]]
+
+                # Boş satırları at
+                df_upload = df_upload.dropna(subset=["name"])
+                df_upload = df_upload[df_upload["name"].astype(str).str.strip() != ""]
+
+                # DB'ye ekle
+                # DB'ye kaydet
+                with get_conn() as conn:
+                    # önce upload_history'ye kayıt ekle
+                    cur = conn.cursor()
+                    cur.execute("INSERT INTO upload_history (filename, uploaded_at) VALUES (?, ?)",
+                                (file.name, datetime.utcnow().isoformat()))
+                    upload_id = cur.lastrowid
+
+                    # products tablosuna dosyadan gelen ürünleri yaz
+                    df_upload["upload_id"] = upload_id  # yeni kolon ekle
+                    df_upload.to_sql("products", conn, if_exists="append", index=False)
+
+                    conn.commit()
+
+
+                st.success("Excel'den ürünler yüklendi!")
+
+            except Exception as e:
+                st.error(f"Excel okunamadı: {e}")
+
+        st.divider()
+        # --- Manuel Ürün Ekle ---
+        with st.expander("➕ Manuel Ürün Ekle"):
+            with st.form("add_manual_product", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+                name = col1.text_input("Ürün Adı")
+                unit = col2.text_input("Birim")
+                col3, col4, col5 = st.columns(3)
+                cost = col3.number_input("Maliyet", 0.0, step=0.01)
+                price = col4.number_input("Satış Fiyatı", 0.0, step=0.01)
+                shelf_price = col5.number_input("Raf Fiyatı", 0.0, step=0.01)
+                col6, col7 = st.columns(2)
+                stock_in = col6.number_input("Stok Girişi", 0, step=1)
+                stock_out = col7.number_input("Stok Çıkışı", 0, step=1)
+                notes = st.text_area("Notlar")
+
+                submitted = st.form_submit_button("Kaydet")
+                if submitted:
+                    with get_conn() as conn:
+                        conn.execute("""
+                            INSERT INTO products 
+                            (name, unit, cost, price, shelf_price, stock_in, stock_out, notes, 
+                            is_active, upload_id, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                        """, (name, unit, cost, price, shelf_price, stock_in, stock_out, notes,
+                            datetime.utcnow().isoformat(), datetime.utcnow().isoformat()))
+                        conn.commit()
+                    st.success("Manuel ürün eklendi!")
+                    st.rerun()
+            # --- Manuel Ürün Sil ---
+        with st.expander("🗑️ Manuel Ürün Sil"):
+            df_all = pd.read_sql("SELECT id, name FROM products WHERE is_active=1 AND upload_id IS NULL", get_conn())
+            if not df_all.empty:
+                selected = st.selectbox("Silinecek ürünü seç:", df_all["name"])
+                if st.button("Sil"):
+                    with get_conn() as conn:
+                        conn.execute("UPDATE products SET is_active=0 WHERE name=?", (selected,))
+                        conn.commit()
+                    st.warning(f"{selected} silindi (is_active=0).")
+                    st.rerun()
+            else:
+                st.info("Silinecek manuel ürün yok.")
+
+                # --- Yükleme Geçmişi ---
+        st.subheader("📜 Yükleme Geçmişi")
+        df_history = pd.read_sql("SELECT * FROM upload_history ORDER BY uploaded_at DESC", get_conn())
+
+        if not df_history.empty:
+            st.table(df_history)
+        else:
+            st.info("Henüz yükleme yapılmadı.")
+            # --- Geçmişten tek dosya silme ---
+        if not df_history.empty:
+            selected_id = st.selectbox("Silmek istediğin yüklemeyi seç (ID):", df_history["id"].tolist())
+
+            if st.button("✗ Seçili Yüklemeyi Sil "):
+                with get_conn() as conn:
+                    conn.execute("DELETE FROM products WHERE upload_id = ?", (selected_id,))
+                    conn.execute("DELETE FROM upload_history WHERE id = ?", (selected_id,))
+                    conn.commit()
+                st.success(f"Yükleme ID {selected_id} ve ürünleri silindi!")
+                st.rerun()
     
-    # Mini archive (last uploads)
-    try:
-        mini_archive("sales", ["Sales","Satışlar","Satislar","SATISLAR"], REQ_SALES, limit=3)
-    except Exception:
-        pass
-    st.subheader(t("sales_archive"))
-    sales_files = sorted((UPLOAD_DIR/"sales").glob("*"))
-    names = [p.name for p in sales_files]
-    if names:
-        sel = st.selectbox(t("file_select"), names, index=len(names)-1)
-        colA,colB,colC = st.columns(3)
-        if colA.button(t("preview_again")):
-            dfv = smart_read(UPLOAD_DIR/"sales"/sel, ["Sales","Satışlar","Satislar","SATISLAR"], REQ_SALES)
-            st.dataframe(localize_df(dfv.head(30)), use_container_width=True)
-        if colB.button(t("reprocess")):
-            # just set as current by touching its mtime
-            path = UPLOAD_DIR/"sales"/sel
-            os.utime(path, None)
+            # --- Excel'i sıfırla ---
+        if st.button("🗑️ Excel verilerini sıfırla"):
+            with get_conn() as conn:
+                conn.execute("DELETE FROM products")
+                conn.execute("DELETE FROM upload_history")
+                conn.commit()
+            st.warning("Tüm Excel verileri silindi!")
             st.rerun()
-        if colC.button(t("delete_files")):
-            path = UPLOAD_DIR/"sales"/sel
-            dst  = TRASH_DIR/"sales"/sel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            try: shutil.move(str(path), str(dst))
-            except Exception: pass
-            st.rerun()
+        st.divider()
 
-    st.subheader(t("trash_mgr"))
-    trash_files = sorted((TRASH_DIR/"sales").glob("*"))
-    trash_names = [p.name for p in trash_files]
-    if trash_names:
-        ts1, ts2 = st.columns(2)
-        to_restore = ts1.selectbox("Seç (restore)" if st.session_state.lang=="tr" else "Select (restore)", trash_names, key="restore_sel")
-        if ts1.button(t("restore_sel")):
-            src = TRASH_DIR/"sales"/to_restore
-            dst = UPLOAD_DIR/"sales"/to_restore
-            try: shutil.move(str(src), str(dst))
-            except Exception: pass
-            st.rerun()
-        if ts2.button(t("empty_trash")):
-            for p in trash_files:
-                try: os.remove(p)
-                except: pass
-            st.rerun()
+    elif menu == T("Stoklar", "Stocks"):
+        # Basit iki dilli helper (genel i18n’i en sonda yapacağız)
+        T = (lambda tr, en: en if st.session_state.get("lang", "Türkçe") != "Türkçe" else tr)
 
-# =========================
-#  REPORTS
-# =========================
-elif choice == "Raporlar":
-    st.header("📊 Reports")
+        st.header(T("📦 Stoklar", "📦 Stocks"))
 
-    # --- Şube Bazlı Stok Tablosu ---
-    branch_q = """
-        SELECT p.name AS Product,
-               m.branch AS Branch,
-               SUM(CASE WHEN m.type='IN' THEN m.quantity ELSE 0 END) -
-               SUM(CASE WHEN m.type='OUT' THEN m.quantity ELSE 0 END) AS Current_Stock
-        FROM products p
-        JOIN movements m ON p.id = m.product_id
-        GROUP BY p.name, m.branch
-    """
-    st.subheader("Branch-based Stock Levels")
-    st.dataframe(pd.read_sql(branch_q, conn), use_container_width=True)
+        # 0) Session state
+        if "stock_df" not in st.session_state:
+            st.session_state.stock_df = None
+        if "stock_last_batch" not in st.session_state:
+            st.session_state.stock_last_batch = None
 
-    # --- Genel Stok Tablosu ---
-    stock_q = """
-        SELECT p.name AS Product,
-               SUM(CASE WHEN m.type='IN'  THEN m.quantity ELSE 0 END) -
-               SUM(CASE WHEN m.type='OUT' THEN m.quantity ELSE 0 END) AS Current_Stock
-        FROM products p
-        LEFT JOIN movements m ON p.id = m.product_id
-        GROUP BY p.id
-    """
-    st.subheader("Overall Stock Status")
-    st.dataframe(pd.read_sql(stock_q, conn), use_container_width=True)
-
-    # --- En Çok Satan Ürünler Tablosu ---
-    top_q = """
-        SELECT p.name AS Product, SUM(l.quantity) AS Total_Sold
-        FROM order_lines l
-        JOIN products p ON l.product_id = p.id
-        GROUP BY p.name
-        ORDER BY Total_Sold DESC
-        LIMIT 10
-    """
-    st.subheader("Top Selling Products")
-    st.dataframe(pd.read_sql(top_q, conn), use_container_width=True)
-
-    # --- Grafik 1: Şube Bazlı Stok ---
-    st.subheader("Branch Stock Chart")
-    branch_df = pd.read_sql(branch_q, conn)
-    if not branch_df.empty:
-        st.bar_chart(branch_df.set_index("Product")["Current_Stock"])
-
-    # --- Grafik 2: Günlük Satışlar ---
-    st.subheader("Daily Sales Chart")
-    sales_q = """
-        SELECT o.date AS Date,
-               SUM(l.quantity * l.unit_price) AS Daily_Sales
-        FROM orders o
-        JOIN order_lines l ON o.id = l.order_id
-        GROUP BY o.date
-        ORDER BY o.date
-    """
-    df_sales_chart = pd.read_sql(sales_q, conn)
-    if not df_sales_chart.empty:
-        st.line_chart(df_sales_chart.set_index("Date"))
-
-# =========================
-#  IMPORT HISTORY
-# =========================
-elif choice==t("menu_imports"):
-    st.header(t("imports_header"))
-    his = pd.read_sql("SELECT id, kind, filename, ts FROM imports ORDER BY ts DESC", conn)
-    st.dataframe(localize_df(his), use_container_width=True)
-    st.download_button(t("imports_download"), df_to_excel_bytes(his,"Imports"), file_name="imports.xlsx")
-    sel = st.selectbox(t("imports_select"), his["id"].tolist() if not his.empty else [])
-    if st.button(t("imports_undo")):
-        if sel:
-            cur.execute("DELETE FROM order_lines WHERE import_id=?", (sel,))
-            cur.execute("DELETE FROM movements   WHERE import_id=?", (sel,))
-            cur.execute("DELETE FROM orders      WHERE import_id=?", (sel,))
-            cur.execute("DELETE FROM imports     WHERE id=?", (sel,))
+        # 0.1) DB şemasını garanti et
+        with get_conn() as conn:
+            # 1) Tablonun varlığını garanti et (en güncel şema)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS stock_raw (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT,
+                    product_name TEXT,
+                    movement TEXT,
+                    quantity REAL,
+                    note TEXT,
+                    current_stock REAL,
+                    uploaded_at TEXT,
+                    batch_id INTEGER
+                )
+            """)
             conn.commit()
-            st.success(t("imports_done").format(x=sel))
-            st.rerun()
+
+            # 2) ŞEMA MİGRASYONU — eski kurulumlarda eksik kolonları ekle
+            try:
+                info = conn.execute("PRAGMA table_info(stock_raw)").fetchall()
+                existing_cols = {row[1] for row in info}  # 0:cid, 1:name, 2:type...
+
+                wanted = {
+                    "uploaded_at": "TEXT",
+                    "batch_id": "INTEGER",
+                    "current_stock": "REAL",
+                }
+                for col, typ in wanted.items():
+                    if col not in existing_cols:
+                        conn.execute(f"ALTER TABLE stock_raw ADD COLUMN {col} {typ}")
+                conn.commit()
+            except Exception as e:
+                # migrasyon hatası olursa sadece bilgi ver, akışı bozma
+                st.warning(f"Şema güncelleme uyarısı: {e}")
+
+        # 1) Excel'den yükle
+        st.subheader(T("📥 Excel'den Yükle", "📥 Import from Excel"))
+        file = st.file_uploader(
+            T("Stok Excel seç (.xlsx, .xls, .xlsm)", "Choose stock Excel (.xlsx, .xls, .xlsm)"),
+            type=["xlsx", "xls", "xlsm"],
+            key="stock_upload_stable"
+        )
+
+        def _norm(s: str) -> str:
+            return (str(s).lower()
+                    .replace("ı","i").replace("ğ","g").replace("ş","s")
+                    .replace("ö","o").replace("ü","u").replace("ç","c")
+                    .strip())
+
+        df_stock = None  # bu render'da kullanılacak tablo
+
+        if file:
+            try:
+                # Sheet & başlık tespiti (A1/C5 fark etmez)
+                raw_book = pd.read_excel(file, sheet_name=None, header=None)
+                candidates = ["Stoklar", "Stok Hareketleri", "StokHareketleri", "Stocks", "Stock"]
+                sheet_name = next((s for s in raw_book.keys()
+                                if any(_norm(c) in _norm(s) for c in candidates)),
+                                list(raw_book.keys())[0])
+                raw = raw_book[sheet_name]
+
+                # başlık satırı: ilk 60 satırda >=2 anahtar yakalanırsa
+                keys = ["urun","ürün","product","adet","miktar","quantity","giris","giriş","cikis","çıkış","movement"]
+                header_row = 0
+                for i in range(min(60, len(raw))):
+                    vals = [str(v).strip().lower() for v in list(raw.iloc[i, :])]
+                    hit = sum(any(k in v for v in vals) for k in keys)
+                    if hit >= 2:
+                        header_row = i
+                        break
+
+                df = pd.read_excel(file, sheet_name=sheet_name, header=header_row)
+                df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed|^nan$", case=False)]
+
+                # kolon eşle
+                rename_map = {}
+                for c in df.columns:
+                    cn = _norm(c)
+                    if cn in ["tarih","date"]:
+                        rename_map[c] = "date"
+                    elif cn in ["urun adi","ürün adı","urun","product","product name"]:
+                        rename_map[c] = "product_name"
+                    elif cn in ["adet","miktar","qty","quantity","piece"]:
+                        rename_map[c] = "quantity"
+                    elif cn in ["giris / cikis","giriş / çıkış","giris","giriş","cikis","çıkış","movement","in/out","in - out"]:
+                        rename_map[c] = "movement"
+                    elif cn in ["aciklama","açıklama","note","notes","description","desc"]:
+                        rename_map[c] = "note"
+                df = df.rename(columns=rename_map)
+
+                # çekirdek kolonlar
+                for need in ["date","product_name","quantity","movement","note"]:
+                    if need not in df.columns:
+                        df[need] = pd.NA
+
+                # tipler
+                df["product_name"] = df["product_name"].astype(str).str.strip()
+                df["quantity"] = (
+                    df["quantity"].astype(str)
+                    .str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+                )
+                df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(float)
+                if "date" in df.columns:
+                    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+
+                # movement standardizasyonu
+                mv = df["movement"].astype(str).str.lower()
+                mv = mv.str.replace("giriş","in").str.replace("giris","in")
+                mv = mv.str.replace("çıkış","out").str.replace("cikis","out")
+                df["movement"] = mv.where(mv.isin(["in","out"]), "in")
+
+                # işaretli miktar + kümülatif
+                df["signed_qty"] = df.apply(lambda r: r["quantity"] if r["movement"]=="in" else -r["quantity"], axis=1)
+                # ürün & tarih varsa sıralayıp No ekleyelim
+                df = df.reset_index(drop=True)
+                sort_cols = [c for c in ["product_name","date"] if c in df.columns]
+                if sort_cols:
+                    df = df.sort_values(by=sort_cols, kind="stable").reset_index(drop=True)
+                df["current_stock"] = df.groupby("product_name")["signed_qty"].cumsum()
+                # Görünüm için sıra numarası
+                df.insert(0, T("Sıra","No"), range(1, len(df)+1))
+
+                # ✅ KALICI KAYIT: hemen DB'ye yaz (batch_id ile)
+                from datetime import datetime
+                batch_id = int(datetime.utcnow().timestamp())
+                to_save = df.rename(columns={T("Sıra","No"): "row_no"}).copy()
+                # DB şemasına uygun kolon seti
+                cols = {str(c).lower(): c for c in to_save.columns}
+                def pick(name, default=None):
+                    return to_save[cols[name]].copy() if name in cols else default
+
+                persist = pd.DataFrame({
+                    "date": pick("date", pd.NaT),
+                    "product_name": pick("product_name",""),
+                    "movement": pick("movement",""),
+                    "quantity": pick("quantity",0.0),
+                    "note": pick("note",""),
+                    "current_stock": pick("current_stock",0.0),
+                })
+                persist["uploaded_at"] = datetime.utcnow().isoformat()
+                persist["batch_id"] = batch_id
+
+                with get_conn() as conn:
+                    persist.to_sql("stock_raw", conn, if_exists="append", index=False)
+                    ensure_daily_backup()
+                # Session'a yaz (ekranda kalsın) + son batch
+                st.session_state.stock_df = df
+                st.session_state.stock_last_batch = batch_id
+
+                st.success(T(f"Stok verisi yüklendi ve kaydedildi (Sayfa: {sheet_name}).",
+                            f"Stock data loaded & saved (Sheet: {sheet_name})."))
+
+                
+
+            except Exception as e:
+                st.error(T(f"Excel okunamadı: {e}", f"Failed to read Excel: {e}"))
+                df_stock = None
+
+        # 2) Uygulama yeniden başlasa bile DB'den geri yükle
+        if df_stock is None:
+            # Önce session’dan dene
+            df_stock = st.session_state.stock_df
+
+        if df_stock is None:
+            # DB’den oku (son batch’i tercih et; yoksa tümünü)
+            try:
+                with get_conn() as conn:
+                    df_db = pd.read_sql("SELECT date, product_name, movement, quantity, note, current_stock, uploaded_at, batch_id FROM stock_raw", conn)
+                if not df_db.empty:
+                    # Son batch’i bul
+                    last_batch = df_db["batch_id"].dropna().astype("int64").max()
+                    dfx = df_db[df_db["batch_id"] == last_batch] if pd.notna(last_batch) else df_db
+                    # tipler
+                    dfx["date"] = pd.to_datetime(dfx["date"], errors="coerce").dt.date
+                    dfx["product_name"] = dfx["product_name"].astype(str)
+                    dfx["movement"] = dfx["movement"].astype(str)
+                    dfx["quantity"] = pd.to_numeric(dfx["quantity"], errors="coerce").fillna(0.0)
+                    dfx["current_stock"] = pd.to_numeric(dfx["current_stock"], errors="coerce").fillna(0.0)
+                    # görünüm No
+                    dfx = dfx.reset_index(drop=True)
+                    dfx.insert(0, T("Sıra","No"), range(1, len(dfx)+1))
+                    st.session_state.stock_df = dfx
+                    st.session_state.stock_last_batch = int(last_batch) if pd.notna(last_batch) else None
+                    df_stock = dfx
+                    st.info(T("Veri DB'den yüklendi.", "Data loaded from DB."))
+            except Exception as e:
+                st.error(T(f"DB okuma hatası: {e}", f"DB read error: {e}"))
+
+        # 3) Filtreler
+        st.subheader(T("🔎 Filtreler", "🔎 Filters"))
+        colF1, colF2 = st.columns([2, 1])
+        search_term = colF1.text_input(T("Ürün adı ara (Enter'a bas)", "Search product name (press Enter)"), value="")
+        mv_pick = colF2.multiselect(
+            T("Hareket tipi", "Movement type"),
+            options=[T("Giriş","In"), T("Çıkış","Out")],
+            default=[T("Giriş","In"), T("Çıkış","Out")]
+        )
+
+        def apply_filters(df):
+            if df is None or df.empty:
+                return df
+            f = df.copy()
+            if search_term:
+                f = f[f["product_name"].astype(str).str.contains(search_term, case=False, na=False)]
+            want = set()
+            if T("Giriş","In") in mv_pick: want.add("in")
+            if T("Çıkış","Out") in mv_pick: want.add("out")
+            if want:
+                f = f[f["movement"].isin(want)]
+            return f
+
+        df_view = apply_filters(df_stock)
+
+        # 4) Görünüm + İndir
+        st.subheader(T("🧾 Görünüm", "🧾 View"))
+        if df_view is not None and not df_view.empty:
+            first_col = "Sıra" if T("Sıra","No")=="Sıra" else "No"
+            cols = [c for c in [first_col,"date","product_name","movement","quantity","current_stock","note"] if c in df_view.columns]
+            show = df_view[cols].copy()
+            show = show.rename(columns={
+                "date": T("Tarih","Date"),
+                "product_name": T("Ürün Adı","Product Name"),
+                "movement": T("Hareket","Movement"),
+                "quantity": T("Adet","Qty"),
+                "current_stock": T("Güncel Stok","Current Stock"),
+                "note": T("Açıklama","Note"),
+            })
+            st.dataframe(show, use_container_width=True)
+
+            from io import BytesIO
+            buff = BytesIO()
+            with pd.ExcelWriter(buff, engine="openpyxl") as w:
+                show.to_excel(w, index=False, sheet_name=T("Stok Hareketleri","Stock Movements"))
+            st.download_button(
+                T("📤 Excel indir (filtreli)","📤 Download Excel (filtered)"),
+                buff.getvalue(),
+                file_name=T("stok_hareketleri.xlsx","stock_movements.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.info(T("Gösterilecek hareket yok.","No movements to show."))
+
+        # 5) Temizleme seçenekleri
+        with st.expander(T("🧹 Temizleme", "🧹 Cleanup")):
+            cA, cB = st.columns(2)
+            if cA.button(T("Geçici tabloyu temizle (ekran)","Clear temporary table (screen)")):
+                st.session_state.stock_df = None
+                st.info(T("Geçici tablo temizlendi. DB etkilenmedi.","Temporary table cleared. DB unaffected."))
+
+            if cB.button(T("⚠️ Tüm stok kayıtlarını DB'den sil","⚠️ Delete ALL stock records from DB")):
+                try:
+                    with get_conn() as conn:
+                        conn.execute("DELETE FROM stock_raw")
+                        conn.commit()
+                    st.session_state.stock_df = None
+                    st.session_state.stock_last_batch = None
+                    st.warning(T("Tüm stok kayıtları silindi.","All stock records deleted."))
+                    st.rerun()
+                except Exception as e:
+                    st.error(T(f"Silme hatası: {e}", f"Delete error: {e}"))
+   
+    elif menu == T("Satışlar", "Sales"):
+        # --- minik TR-EN yardımcı (sonradan global sözlüğe alacağız) ---
+        T = (lambda tr, en: en if st.session_state.get("lang","Türkçe") != "Türkçe" else tr)
+
+        # --- TL format (₺12.345,67) ---
+        def tl(n):
+            try:
+                x = float(n)
+                return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            except Exception:
+                return ""
+
+        # --- tabloyu garanti et + şema migrasyonu ---
+        with get_conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sales_raw (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT,
+                    customer TEXT,
+                    product_name TEXT,
+                    piece REAL,
+                    sale_price REAL,
+                    general_total REAL,
+                    cost REAL,
+                    total_cost REAL,
+                    note TEXT,
+                    uploaded_at TEXT,
+                    batch_id INTEGER
+                )
+            """)
+            # eksik kolonlar varsa ekle
+            info = conn.execute("PRAGMA table_info(sales_raw)").fetchall()
+            cols = {r[1] for r in info}
+            want = {
+                "customer":"TEXT","piece":"REAL","sale_price":"REAL","general_total":"REAL",
+                "cost":"REAL","total_cost":"REAL","uploaded_at":"TEXT","batch_id":"INTEGER","note":"TEXT"
+            }
+            for c, typ in want.items():
+                if c not in cols:
+                    conn.execute(f"ALTER TABLE sales_raw ADD COLUMN {c} {typ}")
+            conn.commit()
+
+        st.header(T("💰 Satışlar", "💰 Sales"))
+
+        # ========== 1) Excel'den yükle ==========
+        st.subheader(T("📥 Excel'den Satış Yükle", "📥 Import Sales from Excel"))
+        up = st.file_uploader(
+            T("Satışlar Excel seç (.xlsx, .xls, .xlsm)", "Choose Sales Excel (.xlsx, .xls, .xlsm)"),
+            type=["xlsx","xls","xlsm"],
+            key="sales_upload_v2"
+        )
+
+        df_upload = None
+        if up is not None:
+            try:
+                # esnek sayfa ve başlık bulucu
+                wb = pd.read_excel(up, sheet_name=None, header=None)
+                # aday isimler / değilse ilk sayfa
+                candidates = ["satış", "satis", "sales", "satışlar", "satislar"]
+                sheet = next((s for s in wb.keys() if any(c in str(s).lower() for c in candidates)), list(wb.keys())[0])
+                raw = wb[sheet]
+
+                # başlık satırı autodetect (ilk 50 satır)
+                keys = ["date","tarih","customer","müşteri","urun","product","piece","adet","price","sale","genel","total"]
+                header_row = 0
+                for i in range(min(50, len(raw))):
+                    vals = [str(v).strip().lower() for v in list(raw.iloc[i,:])]
+                    if sum(any(k in v for k in keys) for v in vals) >= 2:
+                        header_row = i
+                        break
+
+                df = pd.read_excel(up, sheet_name=sheet, header=header_row)
+                # boş/unnamed kolonları at
+                df = df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed|^nan$", case=False)]
+
+                # normalize kol adları
+                def norm(s:str)->str:
+                    return (str(s).lower()
+                            .replace("ı","i").replace("ğ","g").replace("ş","s").replace("ö","o").replace("ü","u").replace("ç","c")
+                            .strip())
+
+                rename = {}
+                for c in df.columns:
+                    cn = norm(c)
+                    if cn in ["date","tarih"]:
+                        rename[c] = "date"
+                    elif cn in ["customer","musteri","müşteri"]:
+                        rename[c] = "customer"
+                    elif cn in ["product name","product","urun adi","urun adı","urun","ürün adi","ürün adı"]:
+                        rename[c] = "product_name"
+                    elif cn in ["piece","adet","miktar","qty","quantity"]:
+                        rename[c] = "piece"
+                    elif cn in ["sale price","saleprice","price","satis fiyati","satış fiyati","satis fiyatı","satış fiyatı","satis","satış"]:
+                        rename[c] = "sale_price"
+                    elif cn in ["general total","genel total","genel toplam","total","genel"]:
+                        rename[c] = "general_total"
+                    elif cn in ["cost","alis fiyati","alış fiyati","alis fiyatı","alış fiyatı","note"]:  # cost ile note çakışmasın
+                        # 'note' özel eşleşecek aşağıda
+                        pass
+                    elif cn in ["total cost","toplam maliyet","total maliyet","maliyet toplam"]:
+                        rename[c] = "total_cost"
+                    elif cn in ["note","not","aciklama","açıklama","notes","desc","description"]:
+                        rename[c] = "note"
+
+                # 'cost' için daha açık eşleşme (üstte note ile karışmasın)
+                for c in df.columns:
+                    cn = norm(c)
+                    if cn in ["cost","alis fiyati","alış fiyati","alis fiyatı","alış fiyatı"]:
+                        rename[c] = "cost"
+
+                df = df.rename(columns=rename)
+
+                # eksik zorunlu kolonları oluştur
+                for need in ["date","customer","product_name","piece","sale_price","general_total","cost","total_cost","note"]:
+                    if need not in df.columns:
+                        df[need] = pd.NA
+
+                # sayı ayıklayıcı (₺, nokta/virgül vs)
+                def to_num(x):
+                    if pd.isna(x): return 0.0
+                    s = str(x)
+                    s = s.replace("₺","").replace("TL","").replace("TRY","").replace(" ","")
+                    # binlik . / , normalize → nokta
+                    s = s.replace(".", "").replace(",", ".")
+                    try:
+                        return float(s)
+                    except:
+                        return 0.0
+
+                # tip dönüşümleri
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+                df["customer"] = df["customer"].astype(str).str.strip()
+                df["product_name"] = df["product_name"].astype(str).str.strip()
+
+                for col in ["piece","sale_price","general_total","cost","total_cost"]:
+                    df[col] = df[col].apply(to_num)
+
+                # eksik hesaplar:
+                df.loc[(df["general_total"].isna()) | (df["general_total"]==0), "general_total"] = \
+                    df["piece"] * df["sale_price"]
+                df.loc[(df["total_cost"].isna()) | (df["total_cost"]==0), "total_cost"] = \
+                    df["piece"] * df["cost"]
+
+                # batch id ve kaydetme
+                with get_conn() as conn:
+                    cur = conn.execute("SELECT COALESCE(MAX(batch_id),0) FROM sales_raw")
+                    next_batch = (cur.fetchone()[0] or 0) + 1
+                    to_save = df[[
+                        "date","customer","product_name","piece","sale_price",
+                        "general_total","cost","total_cost","note"
+                    ]].copy()
+                    to_save["uploaded_at"] = datetime.utcnow().isoformat()
+                    to_save["batch_id"] = next_batch
+                    to_save.to_sql("sales_raw", conn, if_exists="append", index=False)
+                    ensure_daily_backup()
+                st.success(T("Satışlar yüklendi ve kaydedildi.", "Sales uploaded & saved."))
+            except Exception as e:
+                st.error(T(f"Excel okunamadı: {e}", f"Failed to read Excel: {e}"))
+            else:
+                # yükleme sonrası yeniden göster
+                st.rerun()
+
+       
+        # ========== 3) Kümülatif Görünüm + Filtre + İndir ==========
+        st.subheader(T("🧾 Satış Listesi (Kümülatif)", "🧾 Sales List (Cumulative)"))
+        with get_conn() as conn:
+            sales_df = pd.read_sql("""
+                SELECT date, customer, product_name, piece, sale_price,
+                    general_total, cost, total_cost, note, batch_id, uploaded_at
+                FROM sales_raw
+                ORDER BY batch_id DESC, id ASC
+            """, conn)
+
+        if sales_df.empty:
+            st.info(T("Gösterilecek satış yok.", "No sales to show."))
+        else:
+            # filtreler
+            colf1, colf2, colf3 = st.columns([2,1,1])
+            q = colf1.text_input(T("Ürün adı ara (Enter'a bas)", "Search product (press Enter)"), "")
+            # tarih filtreyi güvenli yap (tarih olmayan değerler varsa es geç)
+            sales_df["date"] = pd.to_datetime(sales_df["date"], errors="coerce")
+            valid_dates = sales_df["date"].dropna()
+            if not valid_dates.empty:
+                dmin, dmax = valid_dates.min().date(), valid_dates.max().date()
+                fd1, fd2 = colf2.date_input(T("Başlangıç", "Start"), dmin), colf3.date_input(T("Bitiş", "End"), dmax)
+            else:
+                fd1, fd2 = None, None
+
+            view = sales_df.copy()
+            if q:
+                view = view[view["product_name"].str.contains(q, case=False, na=False)]
+            if fd1 and fd2:
+                view = view[(view["date"]>=pd.to_datetime(fd1)) & (view["date"]<=pd.to_datetime(fd2))]
+            # gösterim
+            show = view.copy()
+            show["date"] = pd.to_datetime(show["date"]).dt.date
+            for c in ["sale_price","general_total","cost","total_cost"]:
+                show[c] = show[c].apply(tl)
+
+            show = show.rename(columns={
+                "date": T("Tarih","Date"),
+                "customer": T("Müşteri","Customer"),
+                "product_name": T("Ürün Adı","Product"),
+                "piece": T("Adet","Piece"),
+                "sale_price": T("Satış Fiyatı","Sale Price"),
+                "general_total": T("Genel Toplam","General Total"),
+                "cost": T("Maliyet","Cost"),
+                "total_cost": T("Toplam Maliyet","Total Cost"),
+                "note": T("Not","Note"),
+                "batch_id": T("Parti","Batch"),
+                "uploaded_at": T("Yüklenme","Uploaded"),
+            })
+            # excel sırası gibi 1..N numara
+            show.insert(0, T("Sıra","No"), range(1, len(show)+1))
+
+            st.dataframe(show, use_container_width=True)
+
+            # indir (filtreli, sayısal kolonları sayı olarak da ekleyelim ikinci sayfada)
+            buff = BytesIO()
+            with pd.ExcelWriter(buff, engine="openpyxl") as w:
+                show.to_excel(w, index=False, sheet_name=T("Görünüm","View"))
+                # Sayısal ham veri:
+                raw_out = view.rename(columns={
+                    "date":"date","customer":"customer","product_name":"product_name","piece":"piece",
+                    "sale_price":"sale_price","general_total":"general_total","cost":"cost","total_cost":"total_cost",
+                    "note":"note","batch_id":"batch_id","uploaded_at":"uploaded_at"
+                })
+                raw_out.to_excel(w, index=False, sheet_name="raw")
+            st.download_button(
+                T("📤 Bu tabloyu indir", "📤 Download this table"),
+                buff.getvalue(),
+                file_name=T("satislar.xlsx","sales.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+             # ========== 2) Yükleme Geçmişi (kümülatif) ==========
+        st.subheader(T("🗂️ Yükleme Geçmişi", "🗂️ Upload History"))
+        with get_conn() as conn:
+            hist = pd.read_sql("""
+                SELECT batch_id,
+                    MIN(uploaded_at) AS uploaded_at,
+                    COUNT(*) AS rows,
+                    SUM(general_total) AS sum_general,
+                    SUM(total_cost) AS sum_cost
+                FROM sales_raw
+                GROUP BY batch_id
+                ORDER BY batch_id DESC
+            """, conn)
+
+        if hist.empty:
+            st.info(T("Henüz satış yüklenmedi.", "No uploads yet."))
+        else:
+            hist_show = hist.copy()
+            hist_show["uploaded_at"] = pd.to_datetime(hist_show["uploaded_at"]).dt.tz_localize(None)
+            hist_show["sum_general_fmt"] = hist_show["sum_general"].apply(tl)
+            hist_show["sum_cost_fmt"] = hist_show["sum_cost"].apply(tl)
+            hist_show = hist_show.rename(columns={
+                "batch_id": T("Parti No","Batch ID"),
+                "uploaded_at": T("Yüklenme Zamanı","Uploaded At"),
+                "rows": T("Satır","Rows"),
+                "sum_general_fmt": T("Genel Toplam","General Total"),
+                "sum_cost_fmt": T("Toplam Maliyet","Total Cost"),
+            })[[T("Parti No","Batch ID"), T("Yüklenme Zamanı","Uploaded At"),
+                T("Satır","Rows"), T("Genel Toplam","General Total"), T("Toplam Maliyet","Total Cost")]]
+
+            st.dataframe(hist_show, use_container_width=True)
+
+            # Son yüklemeyi sil (revize etmek için)
+            last_batch = int(hist["batch_id"].max())
+            with st.expander(T("🗑️ Son Yüklemeyi Sil (Revize)", "🗑️ Delete Last Upload (Revise)")):
+                st.caption(T("Sadece en son parti silinir. Tekrar doğru dosyayı yükleyebilirsiniz.",
+                            "Only the last batch will be deleted. Then re-upload the corrected file."))
+                if st.button(T(f"Son Partiyi Sil (#{last_batch})", f"Delete Last Batch (#{last_batch})")):
+                    try:
+                        with get_conn() as conn:
+                            conn.execute("DELETE FROM sales_raw WHERE batch_id = ?", (last_batch,))
+                            conn.commit()
+                        st.success(T("Son parti silindi.", "Last batch deleted."))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(T(f"Silme hatası: {e}", f"Delete failed: {e}"))
+    

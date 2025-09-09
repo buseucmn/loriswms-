@@ -1,1 +1,11 @@
 .DS_Store
+# --- do not commit local data / secrets ---
+data/
+backups/
+Uploads/
+*.db
+*.xlsx
+*.xls
+*.xlsm
+.streamlit/secrets.toml
+.env
