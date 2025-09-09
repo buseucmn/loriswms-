@@ -9,3 +9,13 @@ Uploads/
 *.xlsm
 .streamlit/secrets.toml
 .env
+venv/
+data/
+backups/
+Uploads/
+*.db
+*.xlsx
+*.xls
+*.xlsm
+.streamlit/secrets.toml
+.env
