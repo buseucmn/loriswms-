@@ -7,8 +7,21 @@ import streamlit as st
 st.set_page_config(layout="wide")
 import shutil
 from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv()
+# --- Load env from .env if available; also map Streamlit secrets to os.environ ---
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# Streamlit Cloud'da st.secrets varsa, os.environ'a taşı ki os.getenv() çalışsın
+try:
+    for k, v in st.secrets.items():
+        # yalnızca env’de yoksa yaz
+        import os as _os
+        _os.environ.setdefault(k, str(v))
+except Exception:
+    pass
 # ---------- DB Helpers (kalıcı kayıt) ----------
 DB_PATH = "data/loris.db"
 
