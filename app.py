@@ -242,26 +242,46 @@ rename_map_sales = {
 
 # Products tablosuna gerekli kolonları ekle (eksikse)
 def ensure_product_columns():
-    expected_cols = {
-        "upload_id": "INTEGER",
-        "product_name": "TEXT",
-        "unit": "TEXT",
-        "cost": "REAL DEFAULT 0",
-        "price": "REAL DEFAULT 0",
-        "shelf_price": "REAL DEFAULT 0",
-        "stock_in": "INTEGER DEFAULT 0",
-        "stock_out": "INTEGER DEFAULT 0",
-        "notes": "TEXT"
+    """
+    Cloud'da/temiz kurulumda products tablosunda eksik kolonları ekler.
+    Bu sayede is_active, upload_id vb. sorgular hatasız çalışır.
+    """
+    needed = {
+        "barcode":      "TEXT",
+        "description":  "TEXT",
+        "is_active":    "INTEGER DEFAULT 1",
+        "upload_id":    "INTEGER",
+        "created_at":   "TEXT",
+        "updated_at":   "TEXT",
+        # bazı görünümler 'stock' kolonunu bekleyebilir; emniyet için ekleyelim
+        "stock":        "INTEGER DEFAULT 0",
+        "stock_in":     "REAL DEFAULT 0",
+        "stock_out":    "REAL DEFAULT 0",
+        "unit":         "TEXT",
+        "cost":         "REAL DEFAULT 0",
+        "price":        "REAL DEFAULT 0",
+        "shelf_price":  "REAL DEFAULT 0",
+        "notes":        "TEXT",
     }
+
     with get_conn() as conn:
-        cur = conn.cursor()
-        # mevcut kolonları oku
-        cur.execute("PRAGMA table_info(products)")
-        existing = [row[1] for row in cur.fetchall()]
-        # eksikleri ekle
-        for col, coltype in expected_cols.items():
+        c = conn.cursor()
+        # En azından tablo mevcut olsun (yalnızca id ve name ile başlat)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL
+            )
+        """)
+        # Mevcut kolonları oku
+        c.execute("PRAGMA table_info(products)")
+        existing = {row[1] for row in c.fetchall()}
+
+        # Eksik kolonları ekle
+        for col, typ in needed.items():
             if col not in existing:
-                cur.execute(f"ALTER TABLE products ADD COLUMN {col} {coltype}")
+                c.execute(f"ALTER TABLE products ADD COLUMN {col} {typ}")
+
         conn.commit()
 
 ensure_product_columns()
