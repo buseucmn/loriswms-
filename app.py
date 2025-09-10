@@ -937,6 +937,16 @@ else:
 
                 with get_conn() as conn:
                     persist.to_sql("stock_raw", conn, if_exists="append", index=False)
+                    # upload_history kaydı (dosya adı varsa)
+                    try:
+                        fname = getattr(file, "name", f"stocks_{batch_id}.xlsx")
+                        conn.execute(
+                            "INSERT INTO upload_history (filename, uploaded_at) VALUES (?, ?)",
+                            (fname, datetime.utcnow().isoformat())
+                        )
+                    except Exception:
+                        pass
+                    conn.commit()
                     ensure_daily_backup()
                 # Session'a yaz (ekranda kalsın) + son batch
                 st.session_state.stock_df = df
@@ -945,7 +955,6 @@ else:
                 st.success(T(f"Stok verisi yüklendi ve kaydedildi (Sayfa: {sheet_name}).",
                             f"Stock data loaded & saved (Sheet: {sheet_name})."))
 
-                
 
             except Exception as e:
                 st.error(T(f"Excel okunamadı: {e}", f"Failed to read Excel: {e}"))
@@ -954,28 +963,35 @@ else:
         # 2) Uygulama yeniden başlasa bile DB'den geri yükle
         if df_stock is None:
             # Önce session’dan dene
-            df_stock = st.session_state.stock_df
+            df_stock = st.session_state.get("stock_df")
 
         if df_stock is None:
             # DB’den oku (son batch’i tercih et; yoksa tümünü)
             try:
                 with get_conn() as conn:
-                    df_db = pd.read_sql("SELECT date, product_name, movement, quantity, note, current_stock, uploaded_at, batch_id FROM stock_raw", conn)
+                    df_db = pd.read_sql("""
+                        SELECT date, product_name, movement, quantity, note, current_stock, uploaded_at, batch_id
+                        FROM stock_raw
+                        ORDER BY id ASC
+                    """, conn)
                 if not df_db.empty:
-                    # Son batch’i bul
-                    last_batch = df_db["batch_id"].dropna().astype("int64").max()
-                    dfx = df_db[df_db["batch_id"] == last_batch] if pd.notna(last_batch) else df_db
+                    # Son batch’i güvenli biçimde bul (metin/sayı fark etmez)
+                    b = pd.to_numeric(df_db["batch_id"], errors="coerce")
+                    last_batch = int(b.max()) if b.notna().any() else None
+                    dfx = df_db[df_db["batch_id"].astype(str) == str(last_batch)] if last_batch is not None else df_db
+
                     # tipler
                     dfx["date"] = pd.to_datetime(dfx["date"], errors="coerce").dt.date
                     dfx["product_name"] = dfx["product_name"].astype(str)
                     dfx["movement"] = dfx["movement"].astype(str)
                     dfx["quantity"] = pd.to_numeric(dfx["quantity"], errors="coerce").fillna(0.0)
                     dfx["current_stock"] = pd.to_numeric(dfx["current_stock"], errors="coerce").fillna(0.0)
+
                     # görünüm No
                     dfx = dfx.reset_index(drop=True)
                     dfx.insert(0, T("Sıra","No"), range(1, len(dfx)+1))
                     st.session_state.stock_df = dfx
-                    st.session_state.stock_last_batch = int(last_batch) if pd.notna(last_batch) else None
+                    st.session_state.stock_last_batch = last_batch
                     df_stock = dfx
                     st.info(T("Veri DB'den yüklendi.", "Data loaded from DB."))
             except Exception as e:
